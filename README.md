@@ -6,9 +6,11 @@ Private Docker-based HTTP gateway for **one user**: n8n -> FastAPI -> Redis -> w
 
 - This is a **personal prototype**, not a multi-user SaaS or production proxy. ChatGPT subscription usage is subject to eligibility, service terms, rate limits and any applicable credits. Sign-in does not provide a general-purpose unlimited OpenAI API.
 - Codex is a coding agent, not an ordinary text-only inference endpoint. The worker invokes `codex exec` in a disposable working directory with read-only sandbox; do not pass secrets, untrusted documents or enable arbitrary tools.
-- The OpenAI-like chat endpoint is deliberately a **subset**: text messages only, no streaming, tool calls, images, embeddings, native chat session, or reliable token accounting. Conversation context must be passed in `messages` each request.
+- The OpenAI-like chat endpoint is deliberately a **subset**: text messages only, no streaming, tool calls, images, embeddings, or reliable token accounting. Requests are stateless unless `store_session` or an existing `session_id` is supplied.
 - API key is shared by the local browser and n8n. Only use on a trusted machine. Never publish port 8088 externally or expose the Docker public network to untrusted containers.
 - Prompts are held in Redis memory while queued, removed when a worker claims the job, and passed to Codex via stdin. Redis persistence is disabled and it has no data volume, so queued jobs and job history are lost if Redis restarts.
+- When session saving is enabled, Codex stores the full conversation (system instructions, prompts and answers) as local session history files in the worker's persistent `codex_auth` volume. Session history is not copied into Redis or another database. Delete a session from the Web Console to remove its Codex history files.
+- Saved sessions have no automatic expiration; remove them from the Dashboard when they are no longer needed.
 - Results, status, and non-sensitive job metadata are kept in Redis memory for `JOB_TTL_SECONDS` (default one hour), then expire. No PostgreSQL service or persistent job database is used.
 - The system has **no provider-side subscription quota API** and cannot determine remaining subscription allowance; rate-limit errors surface as failed jobs.
 
@@ -38,7 +40,7 @@ curl -sS http://127.0.0.1:8088/v1/chat/completions \
 
 If `--device-auth` isn't allowed by the account, consult official Codex CLI sign-in instructions for your installation; do not paste or publish session tokens. `codex login` is another supported interactive sign-in route when a browser callback is available.
 
-Open **http://127.0.0.1:8088/**, unlock with the local Gateway API key, then test a prompt. The UI key stays in browser `sessionStorage` (cleared after closing the tab). This UI is **not** a separate login/account system.
+Open **http://127.0.0.1:8088/**, unlock with the local Gateway API key, then test a prompt. Select **Save this conversation as a Codex session** to save the conversation and continue it on later requests. Manage or delete saved sessions in the Sessions panel. The UI key stays in browser `sessionStorage` (cleared after closing the tab). This UI is **not** a separate login/account system.
 
 ### Upgrading from the PostgreSQL version
 
@@ -76,9 +78,22 @@ networks:
 - `GET /v1/jobs/{id}` — job status/result
 - `GET /admin/overview` — job counts/last 20 jobs
 - `GET /admin/jobs/{id}` — diagnostic event summaries
+- `GET /admin/sessions` and `DELETE /admin/sessions/{session_id}` — list or permanently delete saved Codex sessions
 
 Every route except `/health` requires the shared bearer key.
 Model discovery runs through the worker's authenticated Codex CLI session. The list is a catalog, not a guarantee that the signed-in account can use every entry; the selected model is verified by the next Codex request.
+To save a conversation, set `store_session: true` on its first `/v1/chat/completions` request. The response includes `session_id`; pass that ID on subsequent calls to continue the same Codex thread. If session history is not wanted, omit both fields and each request remains ephemeral.
+Set `system_prompt` to provide Codex developer instructions separately from the user message. The Chat Tester exposes this as a dedicated field. If omitted, normal stateless requests continue to use `codex exec`.
+
+```json
+{"model":"codex-default","store_session":true,"messages":[{"role":"user","content":"ช่วยวางแผนงาน"}]}
+```
+
+Use the returned `session_id` on the next request:
+
+```json
+{"model":"codex-default","session_id":"SESSION_ID_FROM_PREVIOUS_RESPONSE","messages":[{"role":"user","content":"ขอรายละเอียดขั้นตอนแรก"}]}
+```
 
 ### Asynchronous example
 
@@ -102,9 +117,9 @@ curl -sS http://127.0.0.1:8088/v1/jobs \
 
 ### Data & security
 
-- Docker named volume: `codex_auth`. Never publish `codex_auth`; backup/restore with care. Redis has no persistent volume and persistence is disabled.
-- Codex sign-in credentials live in worker volume at `/home/node/.codex`; only the worker mounts it.
-- Redis temporarily contains queued prompt text in memory until a worker claims the job. Job results and status are memory-only and expire automatically. Prompts are not included in API job history. The worker discards Codex event output and does not save stderr text, which may contain sensitive content.
+- Docker named volume: `codex_auth`. It contains Codex sign-in credentials and saved session history. Never publish it; backup/restore with care. Redis has no persistent volume and persistence is disabled.
+- Session history files live under `/home/node/.codex/sessions` in the worker volume. Delete sessions through the Web Console so Codex can remove the history files and metadata together.
+- Redis temporarily contains queued prompt and system instruction text in memory until a worker claims the job. Job results and status are memory-only and expire automatically. Prompts are not included in API job history. The worker discards Codex event output and does not save stderr text, which may contain sensitive content. Opt-in saved sessions do persist full conversation history and instructions on disk.
 - Job cancellation, startup crash recovery, multi-user isolation, rate limiting, reverse-proxy TLS, CSRF session architecture and encrypted-at-rest storage are **not implemented**.
 - Do not put gateway secrets in the n8n exported workflow JSON or commit `.env`.
 - If a worker crashes during a job, that job may remain `running`; inspect with the admin UI and restart/recreate for MVP testing. For production, implement leases/dead-letter queues.
@@ -130,8 +145,8 @@ n8n Docker --HTTP POST--> web nginx :8088 (host) / api:8000 (docker network)
                                    Redis memory queue
                                      |
                                   worker
-                                     |
-                              codex exec --json
-                                     |
-                            ChatGPT sign-in session
+                              /           \
+                codex exec (stateless)   codex app-server (saved threads)
+                              \           /
+                           ChatGPT sign-in session
 ```

@@ -15,10 +15,13 @@ def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
 
-def enqueue(prompt: str, model: str | None):
+def enqueue(prompt: str, model: str | None, session_id: str | None = None,
+            store_session: bool = False, system_prompt: str | None = None):
     job_id = str(uuid.uuid4())
     now = utcnow()
     job = {"id": job_id, "status": "queued", "prompt": prompt, "model": model or "",
+           "session_id": session_id or "", "store_session": "1" if store_session else "0",
+           "system_prompt": system_prompt or "",
            "created_at": now, "finished_at": "", "result": "", "error": "", "duration_ms": ""}
     with redis_client.pipeline(transaction=True) as pipe:
         pipe.hset(f"codex:job:{job_id}", mapping=job)
@@ -33,6 +36,7 @@ def fetch(job_id: str):
     if not job:
         return None
     return {"id": job["id"], "status": job["status"], "model": job.get("model") or None,
+            "session_id": job.get("session_id") or None,
             "result": job.get("result") or None, "error": job.get("error") or None,
             "duration_ms": int(job["duration_ms"]) if job.get("duration_ms") else None,
             "created_at": job.get("created_at") or None, "finished_at": job.get("finished_at") or None}
@@ -62,3 +66,23 @@ def get_model_catalog(timeout_seconds: int = 100):
         time.sleep(0.2)
     redis_client.delete(response_key)
     raise TimeoutError("Timed out waiting for Codex model catalog")
+
+
+def session_control(operation: str, session_id: str | None = None, timeout_seconds: int = 100):
+    request_id = str(uuid.uuid4())
+    response_key = f"codex:session:response:{request_id}"
+    redis_client.lpush("codex:session:requests", json.dumps({
+        "request_id": request_id, "operation": operation, "session_id": session_id
+    }))
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        response = redis_client.get(response_key)
+        if response:
+            redis_client.delete(response_key)
+            payload = json.loads(response)
+            if payload.get("error"):
+                raise RuntimeError(payload["error"])
+            return payload.get("result")
+        time.sleep(0.2)
+    redis_client.delete(response_key)
+    raise TimeoutError("Timed out waiting for session operation")
