@@ -1,0 +1,27 @@
+{
+  "name": "Codex Gateway - Personal Chat Test",
+  "nodes": [
+    {
+      "parameters": {"httpMethod": "POST", "path": "codex-gateway-chat", "responseMode": "responseNode", "options": {}},
+      "id": "8f50c003-79c7-43f2-bd25-4d15db2d468a", "name": "Webhook", "type": "n8n-nodes-base.webhook", "typeVersion": 2, "position": [200,300], "webhookId":"codex-gateway-chat"
+    },
+    {
+      "parameters": {
+        "method": "POST", "url": "http://api:8000/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name":"Authorization","value":"=Bearer {{$env.GATEWAY_API_KEY}}"},{"name":"Content-Type","value":"application/json"}]},
+        "sendBody": true, "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({model: 'codex-default', messages: [{role:'user', content: $json.body?.message || 'สวัสดีครับ'}], stream: false}) }}",
+        "options": {"timeout": 130000}
+      },
+      "id": "3b8e3c67-7136-450b-8a2d-cb2d0af02911", "name": "Codex HTTP", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [440,300]
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify({reply: $json.choices[0].message.content}) }}", "options": {}},
+      "id": "cfd44014-25b6-4787-a7bc-7d96e82cd2f9", "name": "Respond to Webhook", "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.1, "position": [700,300]
+    }
+  ],
+  "connections": {"Webhook": {"main": [[{"node":"Codex HTTP","type":"main","index":0}]]}, "Codex HTTP": {"main": [[{"node":"Respond to Webhook","type":"main","index":0}]]}},
+  "settings": {"executionOrder":"v1"},
+  "active": false
+}
