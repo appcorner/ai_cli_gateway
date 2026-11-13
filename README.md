@@ -40,7 +40,7 @@ curl -sS http://127.0.0.1:8088/v1/chat/completions \
 
 If `--device-auth` isn't allowed by the account, consult official Codex CLI sign-in instructions for your installation; do not paste or publish session tokens. `codex login` is another supported interactive sign-in route when a browser callback is available.
 
-Open **http://127.0.0.1:8088/**, unlock with the local Gateway API key, then test a prompt. Select **Save this conversation as a Codex session** to save the conversation and continue it on later requests. Manage or delete saved sessions in the Sessions panel. The UI key stays in browser `sessionStorage` (cleared after closing the tab). This UI is **not** a separate login/account system.
+Open **http://127.0.0.1:8088/**, unlock with the local Gateway API key, then test a prompt. Select **Save this conversation as a Codex session** to save the conversation and continue it on later requests. Use **Continue** in the Sessions panel to load its message history into the chat tester and send another turn in the same conversation. Manage or delete saved sessions in the Sessions panel. The UI key stays in browser `sessionStorage` (cleared after closing the tab). This UI is **not** a separate login/account system.
 
 ### Upgrading from the PostgreSQL version
 
@@ -78,7 +78,7 @@ networks:
 - `GET /v1/jobs/{id}` — job status/result
 - `GET /admin/overview` — job counts/last 20 jobs
 - `GET /admin/jobs/{id}` — diagnostic event summaries
-- `GET /admin/sessions` and `DELETE /admin/sessions/{session_id}` — list or permanently delete saved Codex sessions
+- `GET /admin/sessions`, `GET /admin/sessions/{session_id}`, and `DELETE /admin/sessions/{session_id}` — list, read history, or permanently delete saved Codex sessions
 
 Every route except `/health` requires the shared bearer key.
 Model discovery runs through the worker's authenticated Codex CLI session. The list is a catalog, not a guarantee that the signed-in account can use every entry; the selected model is verified by the next Codex request.

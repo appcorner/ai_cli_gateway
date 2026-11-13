@@ -155,6 +155,13 @@ def admin_sessions():
     except Exception as exc:
         raise HTTPException(503, f"Could not list Codex sessions: {type(exc).__name__}") from exc
 
+@app.get("/admin/sessions/{session_id}", dependencies=[Depends(auth)])
+def admin_session_history(session_id: str):
+    try:
+        return session_control("history", session_id)
+    except Exception as exc:
+        raise HTTPException(503, f"Could not read Codex session: {type(exc).__name__}") from exc
+
 @app.delete("/admin/sessions/{session_id}", dependencies=[Depends(auth)])
 def delete_admin_session(session_id: str):
     try:

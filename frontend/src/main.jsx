@@ -12,6 +12,8 @@ function App(){
   const [prompt,setPrompt]=useState('สวัสดีค่ะ อธิบายว่าคุณช่วยอะไรได้บ้างแบบสั้นๆ');
   const [sending,setSending]=useState(false);
   const [answer,setAnswer]=useState('');
+  const [chatMessages,setChatMessages]=useState([]);
+  const [historyLoading,setHistoryLoading]=useState(false);
   const [modelCatalog,setModelCatalog]=useState([]);
   const [selectedModel,setSelectedModel]=useState('codex-default');
   const [sessions,setSessions]=useState([]);
@@ -42,16 +44,20 @@ function App(){
   useEffect(()=>{refresh();refreshSessions();const timer=setInterval(refresh,10000);const sessionTimer=setInterval(refreshSessions,60000);return()=>{clearInterval(timer);clearInterval(sessionTimer)}},[refresh,refreshSessions]);
   const login=()=>{sessionStorage.setItem('gatewayToken',draft.trim());setToken(draft.trim());setDraft('')};
   const logout=()=>{sessionStorage.removeItem('gatewayToken');setToken('');setOverview(null);setAnswer('');setSessions([])};
-  const startSession=()=>{setSessionId('');setSaveSession(true);setAnswer('');setError('')};
+  const startSession=()=>{setSessionId('');setSaveSession(true);setAnswer('');setChatMessages([]);setError('')};
   const test=async()=>{
     setSending(true);setAnswer('');setError('');
+    const userMessage=prompt.trim();
+    setChatMessages(current=>[...current,{role:'user',content:userMessage}]);
     try{
       const result=await request('/v1/chat/completions',{method:'POST',body:JSON.stringify({
-        model:selectedModel,messages:[{role:'user',content:prompt}],stream:false,
+        model:selectedModel,messages:[{role:'user',content:userMessage}],stream:false,
         session_id:saveSession?sessionId||null:null,store_session:saveSession&&!sessionId,
         system_prompt:systemPrompt.trim()||null
       })});
-      setAnswer(result.choices?.[0]?.message?.content||'(empty)');
+      const reply=result.choices?.[0]?.message?.content||'(empty)';
+      setAnswer(reply);
+      setChatMessages(current=>[...current,{role:'assistant',content:reply}]);
       if(result.session_id){setSessionId(result.session_id);setSaveSession(true)}
       await Promise.all([refresh(),refreshSessions()]);
     }catch(e){setError(e.message)}finally{setSending(false)}
@@ -60,11 +66,16 @@ function App(){
     if(!window.confirm('ลบ session นี้พร้อมประวัติข้อความถาวรใช่ไหมคะ?'))return;
     try{
       await request('/admin/sessions/'+encodeURIComponent(id),{method:'DELETE'});
-      if(sessionId===id){setSessionId('');setSaveSession(false);setAnswer('')}
+      if(sessionId===id){setSessionId('');setSaveSession(false);setAnswer('');setChatMessages([])}
       await Promise.all([refresh(),refreshSessions()]);
     }catch(e){setError(e.message)}
   };
-  const continueSession=id=>{setSessionId(id);setSaveSession(true);setAnswer('');document.getElementById('tester')?.scrollIntoView({behavior:'smooth'})};
+  const continueSession=async id=>{
+    setSessionId(id);setSaveSession(true);setAnswer('');setChatMessages([]);setError('');setHistoryLoading(true);
+    document.getElementById('tester')?.scrollIntoView({behavior:'smooth'});
+    try{const history=await request('/admin/sessions/'+encodeURIComponent(id));setChatMessages(history.messages||[])}
+    catch(e){setError(e.message)}finally{setHistoryLoading(false)}
+  };
   const formatDate=value=>value?new Date(typeof value==='number'&&value<1e12?value*1000:value).toLocaleString():'—';
 
   if(!token)return <main className="login"><div className="login-card"><div className="brand"><Terminal size={28}/> Codex Gateway</div><p>Personal Management Console</p><label>Gateway API Key</label><input type="password" value={draft} onChange={e=>setDraft(e.target.value)} onKeyDown={e=>e.key==='Enter'&&login()} placeholder="Paste GATEWAY_API_KEY"/><button disabled={!draft.trim()} onClick={login}><Lock size={16}/> Unlock Console</button><small>Key is held only in this browser tab session. Access from localhost only.</small></div></main>;
@@ -82,7 +93,8 @@ function App(){
         {saveSession&&<div className="session-current">{sessionId?<>Continuing session <code>{sessionId}</code></>:<>A new session will be created with this request.</>} <button className="secondary" onClick={startSession}><Plus size={15}/> New session</button></div>}
         <p>A system prompt guides Codex's behavior. Saved sessions include prompts and answers in Codex history files.</p>
         <label>System prompt</label><textarea rows="3" value={systemPrompt} onChange={e=>setSystemPrompt(e.target.value)} placeholder="กำหนดบทบาท รูปแบบคำตอบ หรือข้อกำหนดให้ Codex"/>
-        <label>User message</label><textarea rows="4" value={prompt} onChange={e=>setPrompt(e.target.value)}/><button disabled={sending||!prompt.trim()} onClick={test}><Send size={16}/> {sending?'Running Codex...':'Send Request'}</button>{answer&&<pre className="answer">{answer}</pre>}
+        {sessionId&&<div className="chat-transcript" aria-live="polite">{historyLoading?<p className="muted">Loading conversation…</p>:chatMessages.map((message,index)=><div className={'chat-bubble '+message.role} key={index}><small>{message.role==='assistant'?'Codex':'You'}</small><div>{message.content}</div></div>)}</div>}
+        <label>{sessionId?'Your next message':'User message'}</label><textarea rows="4" value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'&&!sending&&prompt.trim())test()}}/><button disabled={sending||!prompt.trim()} onClick={test}><Send size={16}/> {sending?'Running Codex...':sessionId?'Send Message':'Send Request'}</button>{sessionId&&<small className="composer-hint">Ctrl+Enter to send · This continues the selected session</small>}{!sessionId&&answer&&<pre className="answer">{answer}</pre>}
       </section>
       <section className="panel" id="sessions"><div className="section-title"><h2>Saved Sessions</h2><span className="muted">{sessions.length} found</span></div><p>Deleting a session removes its saved Codex history file.</p><div className="table-scroll"><table><thead><tr><th>Session ID</th><th>Last Updated</th><th>Model</th><th>Actions</th></tr></thead><tbody>{sessions.map(s=><tr key={s.id}><td title={s.id}>{s.id.slice(0,8)}</td><td>{formatDate(s.updated_at)}</td><td>{s.model||'—'}</td><td><button className="secondary session-action" onClick={()=>continueSession(s.id)}><MessageCircle size={15}/> Continue</button> <button className="ghost danger session-action" onClick={()=>deleteSession(s.id)} title="Delete session"><Trash2 size={16}/> Delete</button></td></tr>)}{!sessions.length&&<tr><td colSpan="4" className="empty">No saved sessions</td></tr>}</tbody></table></div></section>
       <section className="panel" id="jobs"><div className="section-title"><h2>Recent Jobs</h2><span className="muted">Expires automatically</span></div><div className="table-scroll"><table><thead><tr><th>Job ID</th><th>Status</th><th>Duration</th><th>Created</th></tr></thead><tbody>{(overview?.jobs||[]).map(j=><tr key={j.id}><td title={j.id}>{j.id.slice(0,8)}</td><td><span className={'status '+j.status}>{j.status}</span></td><td>{j.duration_ms!=null?Math.round(j.duration_ms/1000)+' s':'—'}</td><td>{formatDate(j.created_at)}</td></tr>)}{!overview?.jobs?.length&&<tr><td colSpan="4" className="empty">No jobs yet</td></tr>}</tbody></table></div></section>

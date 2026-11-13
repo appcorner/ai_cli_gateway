@@ -301,6 +301,27 @@ def perform_session_control(operation, session_id=None):
                 if not cursor:
                     break
             return sessions
+        if operation == "history" and session_id:
+            response = send_rpc(process, incoming, 2, "thread/read",
+                                {"threadId": session_id, "includeTurns": True})
+            thread = response.get("thread", response)
+            messages = []
+            for turn in thread.get("turns", []):
+                for item in turn.get("items", []):
+                    kind = item.get("type")
+                    if kind == "userMessage":
+                        content = item.get("content", [])
+                        text = "\n".join(part.get("text", "") for part in content
+                                        if part.get("type") == "text").strip()
+                        role = "user"
+                    elif kind == "agentMessage":
+                        text = item.get("text", "").strip()
+                        role = "assistant"
+                    else:
+                        continue
+                    if text:
+                        messages.append({"role": role, "content": text})
+            return {"id": session_id, "messages": messages}
         if operation == "delete" and session_id:
             lock_key = f"codex:session:lock:{session_id}"
             lock_value = f"delete-{uuid.uuid4()}"
