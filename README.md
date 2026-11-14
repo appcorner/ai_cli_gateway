@@ -11,7 +11,7 @@ Private Docker-based HTTP gateway for **one user**: n8n -> FastAPI -> Redis -> w
 - Prompts are held in Redis memory while queued, removed when a worker claims the job, and passed to Codex via stdin. Redis persistence is disabled and it has no data volume, so queued jobs and job history are lost if Redis restarts.
 - When session saving is enabled, Codex stores the full conversation (system instructions, prompts and answers) as local session history files in the worker's persistent `codex_auth` volume. Session history is not copied into Redis or another database. Delete a session from the Web Console to remove its Codex history files.
 - Saved sessions have no automatic expiration; remove them from the Dashboard when they are no longer needed.
-- Results, status, and non-sensitive job metadata are kept in Redis memory for `JOB_TTL_SECONDS` (default one hour), then expire. No PostgreSQL service or persistent job database is used.
+- Results, status, and non-sensitive job metadata are kept in Redis memory for `JOB_TTL_SECONDS` (default one hour), then expire.
 - The system has **no provider-side subscription quota API** and cannot determine remaining subscription allowance; rate-limit errors surface as failed jobs.
 
 ## Prerequisites
@@ -41,10 +41,6 @@ curl -sS http://127.0.0.1:8088/v1/chat/completions \
 If `--device-auth` isn't allowed by the account, consult official Codex CLI sign-in instructions for your installation; do not paste or publish session tokens. `codex login` is another supported interactive sign-in route when a browser callback is available.
 
 Open **http://127.0.0.1:8088/**, unlock with the local Gateway API key, then chat in the tester. Unsaved chat context stays in browser memory and is sent with later turns; enable **Save conversation** to persist it as a Codex session and continue it later. Use **Continue** in the Sessions panel to load the saved history. Named System prompt templates are saved in this browser's `localStorage`; they are not uploaded until used in a request. Manage or delete saved sessions in the Sessions panel. The UI key stays in browser `sessionStorage` (cleared after closing the tab). This UI is **not** a separate login/account system.
-
-### Upgrading from the PostgreSQL version
-
-If the previous Compose version was started, run `docker compose down --remove-orphans` before starting this version. This removes the old PostgreSQL container but keeps named volumes. If you also want to erase its old job history, inspect `docker volume ls` and remove only the project's `*_postgres_data` volume after confirming the name. Do not use `docker compose down -v` unless you also intend to delete the Codex sign-in volume.
 
 ## n8n integration
 
