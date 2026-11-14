@@ -14,6 +14,55 @@ redis = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
 TIMEOUT = max(10, min(int(os.environ.get("JOB_TIMEOUT_SECONDS", "120")), 900))
 CONCURRENCY = max(1, min(int(os.environ.get("MAX_CONCURRENT_JOBS", "1")), 4))
 JOB_TTL_SECONDS = max(60, int(os.environ.get("JOB_TTL_SECONDS", "3600")))
+CODEX_HOME = os.environ.get("CODEX_HOME", "/home/node/.codex")
+CHAT_CODEX_HOME = os.path.join(CODEX_HOME, "chat-mode")
+CHAT_HOME_LOCK = threading.Lock()
+CHAT_CONFIG = '''model_reasoning_effort = "low"
+model_verbosity = "low"
+model_reasoning_summary = "none"
+sandbox_mode = "read-only"
+approval_policy = "never"
+web_search = "disabled"
+project_doc_max_bytes = 0
+
+[skills]
+include_instructions = false
+
+[skills.bundled]
+enabled = false
+'''
+
+
+def codex_environment(mode="agent"):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GATEWAY_API_KEY", "DATABASE_URL", "POSTGRES_PASSWORD")}
+    if mode == "chat":
+        with CHAT_HOME_LOCK:
+            os.makedirs(CHAT_CODEX_HOME, mode=0o700, exist_ok=True)
+            config_path = os.path.join(CHAT_CODEX_HOME, "config.toml")
+            temporary_config = config_path + ".tmp"
+            with open(temporary_config, "w", encoding="utf-8") as config_file:
+                config_file.write(CHAT_CONFIG)
+            os.replace(temporary_config, config_path)
+            auth_path = os.path.join(CHAT_CODEX_HOME, "auth.json")
+            if not os.path.lexists(auth_path):
+                try:
+                    os.symlink(os.path.join(CODEX_HOME, "auth.json"), auth_path)
+                except FileExistsError:
+                    pass
+        env["CODEX_HOME"] = CHAT_CODEX_HOME
+        env["HOME"] = CHAT_CODEX_HOME
+    return env
+
+
+def chat_config_args():
+    values = [
+        'model_reasoning_effort="low"', 'model_verbosity="low"',
+        'model_reasoning_summary="none"', 'web_search="disabled"',
+        'project_doc_max_bytes=0', 'skills.include_instructions=false',
+        'skills.bundled.enabled=false',
+    ]
+    return [part for value in values for part in ("-c", value)]
 
 
 def execute(job_id):
@@ -37,13 +86,14 @@ def execute(job_id):
     session_id = job.get("session_id") or None
     store_session = job.get("store_session") == "1"
     system_prompt = job.get("system_prompt") or None
+    mode = job.get("mode") or "chat"
     result = None
     error = None
     status = "failed"
     if session_id or store_session or system_prompt:
         try:
             persistent_session = bool(session_id or store_session)
-            result, session_id = run_session_turn(prompt, model, session_id, system_prompt, store_session)
+            result, session_id = run_session_turn(prompt, model, session_id, system_prompt, store_session, mode)
             if not persistent_session:
                 session_id = None
             status = "completed" if result else "failed"
@@ -56,15 +106,16 @@ def execute(job_id):
             outfile = os.path.join(workdir, "answer.txt")
             cmd = ["codex", "exec", "--json", "--ephemeral", "--sandbox", "read-only",
                    "--skip-git-repo-check", "--output-last-message", outfile]
+            env = codex_environment(mode)
+            if mode == "chat":
+                cmd.extend(["--ignore-user-config", *chat_config_args()])
             if model:
                 cmd.extend(["--model", model])
             cmd.append("-")
             try:
                 p = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
                                    cwd=workdir, timeout=TIMEOUT, check=False,
-                                   env={k: v for k, v in os.environ.items()
-                                        if k not in ("GATEWAY_API_KEY", "POSTGRES_PASSWORD")}
-                                   | {"CI": "1"})
+                                   env=env | {"CI": "1"})
                 # Parse and discard CLI event output; it can contain prompt or response text.
                 for line in p.stdout.splitlines():
                     try:
@@ -91,7 +142,7 @@ def execute(job_id):
                                 "finished_at": datetime.now(timezone.utc).isoformat()})
         redis.expire(key, JOB_TTL_SECONDS)
     if session_id:
-        redis.delete("codex:sessions:list")
+        redis.delete("codex:sessions:list:agent", "codex:sessions:list:chat")
     print(f"job={job_id} status={status} duration_ms={duration_ms}", flush=True)
 
 
@@ -162,12 +213,14 @@ def read_models_from_codex():
             process.kill()
 
 
-def initialized_app_server():
-    process = subprocess.Popen(["codex", "app-server", "--listen", "stdio://"],
+def initialized_app_server(mode="agent"):
+    command = ["codex", "app-server", "--listen", "stdio://"]
+    if mode == "chat":
+        command.extend(chat_config_args())
+    process = subprocess.Popen(command,
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, text=True, bufsize=1,
-                               env={k: v for k, v in os.environ.items()
-                                    if k not in ("GATEWAY_API_KEY", "DATABASE_URL", "POSTGRES_PASSWORD")})
+                               env=codex_environment(mode))
     incoming = queue.Queue()
 
     def read_stdout():
@@ -192,7 +245,7 @@ def send_rpc(process, incoming, request_id, method, params, notifications=None, 
     return rpc_response(incoming, process, request_id, timeout=timeout, notifications=notifications)
 
 
-def run_session_turn(prompt, model, session_id=None, system_prompt=None, store_session=False):
+def run_session_turn(prompt, model, session_id=None, system_prompt=None, store_session=False, mode="agent"):
     lock_key = f"codex:session:lock:{session_id}" if session_id else None
     lock_value = str(uuid.uuid4())
     locked = False
@@ -208,7 +261,7 @@ def run_session_turn(prompt, model, session_id=None, system_prompt=None, store_s
     process = None
     notifications = []
     try:
-        process, incoming = initialized_app_server()
+        process, incoming = initialized_app_server(mode)
         safety = {"cwd": "/work", "sandbox": "read-only", "approvalPolicy": "never"}
         if session_id:
             if system_prompt:
@@ -281,8 +334,8 @@ def run_session_turn(prompt, model, session_id=None, system_prompt=None, store_s
                        1, lock_key, lock_value)
 
 
-def perform_session_control(operation, session_id=None):
-    process, incoming = initialized_app_server()
+def perform_session_control(operation, session_id=None, mode="agent"):
+    process, incoming = initialized_app_server(mode)
     try:
         if operation == "list":
             sessions = []
@@ -293,7 +346,7 @@ def perform_session_control(operation, session_id=None):
                 if cursor:
                     params["cursor"] = cursor
                 response = send_rpc(process, incoming, request_id, "thread/list", params)
-                sessions.extend({"id": item.get("id"), "updated_at": item.get("updatedAt"),
+                sessions.extend({"id": item.get("id"), "mode": mode, "updated_at": item.get("updatedAt"),
                                  "created_at": item.get("createdAt"), "model": item.get("model"),
                                  "status": item.get("status", {}).get("type") if isinstance(item.get("status"), dict) else None}
                                 for item in response.get("data", []) if item.get("id"))
@@ -311,8 +364,11 @@ def perform_session_control(operation, session_id=None):
                     kind = item.get("type")
                     if kind == "userMessage":
                         content = item.get("content", [])
-                        text = "\n".join(part.get("text", "") for part in content
-                                        if part.get("type") == "text").strip()
+                        if isinstance(content, str):
+                            text = content.strip()
+                        else:
+                            text = "\n".join(part.get("text", "") for part in content
+                                            if part.get("type") == "text").strip()
                         role = "user"
                     elif kind == "agentMessage":
                         text = item.get("text", "").strip()
@@ -371,15 +427,17 @@ def session_control_loop():
             request_id = request["request_id"]
             response_key = f"codex:session:response:{request_id}"
             try:
+                mode = request.get("mode", "agent")
                 if request["operation"] == "list":
-                    cached = redis.get("codex:sessions:list")
-                    result = json.loads(cached) if cached else perform_session_control("list")
+                    cache_key = f"codex:sessions:list:{mode}"
+                    cached = redis.get(cache_key)
+                    result = json.loads(cached) if cached else perform_session_control("list", mode=mode)
                     if not cached:
-                        redis.setex("codex:sessions:list", 30, json.dumps(result))
+                        redis.setex(cache_key, 30, json.dumps(result))
                     payload = {"result": result}
                 else:
-                    result = perform_session_control(request["operation"], request.get("session_id"))
-                    redis.delete("codex:sessions:list")
+                    result = perform_session_control(request["operation"], request.get("session_id"), mode)
+                    redis.delete("codex:sessions:list:agent", "codex:sessions:list:chat")
                     payload = {"result": result}
             except Exception as exc:
                 payload = {"error": f"Session operation failed: {type(exc).__name__}"}

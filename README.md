@@ -40,7 +40,7 @@ curl -sS http://127.0.0.1:8088/v1/chat/completions \
 
 If `--device-auth` isn't allowed by the account, consult official Codex CLI sign-in instructions for your installation; do not paste or publish session tokens. `codex login` is another supported interactive sign-in route when a browser callback is available.
 
-Open **http://127.0.0.1:8088/**, unlock with the local Gateway API key, then test a prompt. Select **Save this conversation as a Codex session** to save the conversation and continue it on later requests. Use **Continue** in the Sessions panel to load its message history into the chat tester and send another turn in the same conversation. Manage or delete saved sessions in the Sessions panel. The UI key stays in browser `sessionStorage` (cleared after closing the tab). This UI is **not** a separate login/account system.
+Open **http://127.0.0.1:8088/**, unlock with the local Gateway API key, then chat in the tester. Unsaved chat context stays in browser memory and is sent with later turns; enable **Save conversation** to persist it as a Codex session and continue it later. Use **Continue** in the Sessions panel to load the saved history. Named System prompt templates are saved in this browser's `localStorage`; they are not uploaded until used in a request. Manage or delete saved sessions in the Sessions panel. The UI key stays in browser `sessionStorage` (cleared after closing the tab). This UI is **not** a separate login/account system.
 
 ### Upgrading from the PostgreSQL version
 
@@ -82,17 +82,19 @@ networks:
 
 Every route except `/health` requires the shared bearer key.
 Model discovery runs through the worker's authenticated Codex CLI session. The list is a catalog, not a guarantee that the signed-in account can use every entry; the selected model is verified by the next Codex request.
-To save a conversation, set `store_session: true` on its first `/v1/chat/completions` request. The response includes `session_id`; pass that ID on subsequent calls to continue the same Codex thread. If session history is not wanted, omit both fields and each request remains ephemeral.
+`gateway_options.mode` selects `chat` (default) or `agent`. Chat mode uses a clean `CODEX_HOME` containing only the shared sign-in file, disables user/project extensions, bundled Skills and web search, sets reasoning/verbosity low, and limits stateless request history to the last 10 messages (adjustable up to 50). Codex's built-in agent runtime instructions still apply. Agent mode uses the regular Codex home/configuration. The Chat Tester has the same mode selector.
+
+To save a conversation, set `store_session: true` on its first `/v1/chat/completions` request. The response includes `session_id`; pass that ID on subsequent calls to continue the same Codex thread. Also pass the same `gateway_options.mode` on subsequent calls. If session history is not wanted, omit both fields and each request remains ephemeral.
 Set `system_prompt` to provide Codex developer instructions separately from the user message. The Chat Tester exposes this as a dedicated field. If omitted, normal stateless requests continue to use `codex exec`.
 
 ```json
-{"model":"codex-default","store_session":true,"messages":[{"role":"user","content":"ช่วยวางแผนงาน"}]}
+{"model":"codex-default","store_session":true,"gateway_options":{"mode":"chat"},"messages":[{"role":"user","content":"ช่วยวางแผนงาน"}]}
 ```
 
 Use the returned `session_id` on the next request:
 
 ```json
-{"model":"codex-default","session_id":"SESSION_ID_FROM_PREVIOUS_RESPONSE","messages":[{"role":"user","content":"ขอรายละเอียดขั้นตอนแรก"}]}
+{"model":"codex-default","session_id":"SESSION_ID_FROM_PREVIOUS_RESPONSE","gateway_options":{"mode":"chat"},"messages":[{"role":"user","content":"ขอรายละเอียดขั้นตอนแรก"}]}
 ```
 
 ### Asynchronous example
@@ -118,7 +120,7 @@ curl -sS http://127.0.0.1:8088/v1/jobs \
 ### Data & security
 
 - Docker named volume: `codex_auth`. It contains Codex sign-in credentials and saved session history. Never publish it; backup/restore with care. Redis has no persistent volume and persistence is disabled.
-- Session history files live under `/home/node/.codex/sessions` in the worker volume. Delete sessions through the Web Console so Codex can remove the history files and metadata together.
+- Agent session history files live under `/home/node/.codex/sessions`; Chat session files live under `/home/node/.codex/chat-mode/sessions` in the same worker volume. Chat mode shares only the `auth.json` sign-in file with Agent mode. Delete sessions through the Web Console so Codex can remove the history files and metadata together.
 - Redis temporarily contains queued prompt and system instruction text in memory until a worker claims the job. Job results and status are memory-only and expire automatically. Prompts are not included in API job history. The worker discards Codex event output and does not save stderr text, which may contain sensitive content. Opt-in saved sessions do persist full conversation history and instructions on disk.
 - Job cancellation, startup crash recovery, multi-user isolation, rate limiting, reverse-proxy TLS, CSRF session architecture and encrypted-at-rest storage are **not implemented**.
 - Do not put gateway secrets in the n8n exported workflow JSON or commit `.env`.

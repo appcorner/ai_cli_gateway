@@ -16,12 +16,14 @@ def utcnow():
 
 
 def enqueue(prompt: str, model: str | None, session_id: str | None = None,
-            store_session: bool = False, system_prompt: str | None = None):
+            store_session: bool = False, system_prompt: str | None = None,
+            mode: str = "chat"):
     job_id = str(uuid.uuid4())
     now = utcnow()
     job = {"id": job_id, "status": "queued", "prompt": prompt, "model": model or "",
            "session_id": session_id or "", "store_session": "1" if store_session else "0",
            "system_prompt": system_prompt or "",
+           "mode": mode,
            "created_at": now, "finished_at": "", "result": "", "error": "", "duration_ms": ""}
     with redis_client.pipeline(transaction=True) as pipe:
         pipe.hset(f"codex:job:{job_id}", mapping=job)
@@ -68,11 +70,12 @@ def get_model_catalog(timeout_seconds: int = 100):
     raise TimeoutError("Timed out waiting for Codex model catalog")
 
 
-def session_control(operation: str, session_id: str | None = None, timeout_seconds: int = 100):
+def session_control(operation: str, session_id: str | None = None, mode: str = "agent",
+                    timeout_seconds: int = 100):
     request_id = str(uuid.uuid4())
     response_key = f"codex:session:response:{request_id}"
     redis_client.lpush("codex:session:requests", json.dumps({
-        "request_id": request_id, "operation": operation, "session_id": session_id
+        "request_id": request_id, "operation": operation, "session_id": session_id, "mode": mode
     }))
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:

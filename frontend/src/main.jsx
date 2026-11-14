@@ -1,4 +1,4 @@
-import React, {useState, useEffect, useCallback} from 'react';
+import React, {useState, useEffect, useCallback, useRef} from 'react';
 import {createRoot} from 'react-dom/client';
 import {Activity, Send, RefreshCw, Lock, LogOut, Terminal, Server, ListTodo, Trash2, Plus, MessageCircle} from 'lucide-react';
 import './style.css';
@@ -9,16 +9,23 @@ function App(){
   const [overview,setOverview]=useState(null);
   const [error,setError]=useState('');
   const [systemPrompt,setSystemPrompt]=useState('');
-  const [prompt,setPrompt]=useState('สวัสดีค่ะ อธิบายว่าคุณช่วยอะไรได้บ้างแบบสั้นๆ');
+  const [prompt,setPrompt]=useState('');
   const [sending,setSending]=useState(false);
   const [answer,setAnswer]=useState('');
   const [chatMessages,setChatMessages]=useState([]);
   const [historyLoading,setHistoryLoading]=useState(false);
   const [modelCatalog,setModelCatalog]=useState([]);
   const [selectedModel,setSelectedModel]=useState('codex-default');
+  const [executionMode,setExecutionMode]=useState('chat');
   const [sessions,setSessions]=useState([]);
   const [sessionId,setSessionId]=useState('');
   const [saveSession,setSaveSession]=useState(false);
+  const [savedSystemPrompts,setSavedSystemPrompts]=useState(()=>{
+    try{const items=JSON.parse(localStorage.getItem('codexGateway.savedSystemPrompts')||'[]');return Array.isArray(items)?items:[]}catch{return []}
+  });
+  const [selectedSystemPromptId,setSelectedSystemPromptId]=useState('');
+  const [systemPromptName,setSystemPromptName]=useState('');
+  const chatTranscriptRef=useRef(null);
 
   const request=useCallback(async(path,options={})=>{
     const r=await fetch(path,{...options,headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json',...(options.headers||{})}});
@@ -42,38 +49,67 @@ function App(){
   },[token,request]);
 
   useEffect(()=>{refresh();refreshSessions();const timer=setInterval(refresh,10000);const sessionTimer=setInterval(refreshSessions,60000);return()=>{clearInterval(timer);clearInterval(sessionTimer)}},[refresh,refreshSessions]);
+  useEffect(()=>{const panel=chatTranscriptRef.current;if(panel)panel.scrollTop=panel.scrollHeight},[chatMessages,sending,historyLoading]);
   const login=()=>{sessionStorage.setItem('gatewayToken',draft.trim());setToken(draft.trim());setDraft('')};
   const logout=()=>{sessionStorage.removeItem('gatewayToken');setToken('');setOverview(null);setAnswer('');setSessions([])};
-  const startSession=()=>{setSessionId('');setSaveSession(true);setAnswer('');setChatMessages([]);setError('')};
+  const startSession=()=>{setSessionId('');setSaveSession(true);setAnswer('');setChatMessages([]);setPrompt('');setError('')};
+  const newChat=()=>{setSessionId('');setSaveSession(false);setAnswer('');setChatMessages([]);setPrompt('');setError('')};
+  const persistSystemPrompts=items=>{
+    setSavedSystemPrompts(items);
+    localStorage.setItem('codexGateway.savedSystemPrompts',JSON.stringify(items));
+  };
+  const saveSystemPrompt=(asNew=false)=>{
+    const name=systemPromptName.trim();
+    const content=systemPrompt.trim();
+    if(!name||!content){setError('Enter a name and system prompt before saving.');return}
+    const id=!asNew&&selectedSystemPromptId?selectedSystemPromptId:String(Date.now());
+    const item={id,name,content};
+    const items=!asNew&&selectedSystemPromptId?savedSystemPrompts.map(saved=>saved.id===id?item:saved):[...savedSystemPrompts,item];
+    persistSystemPrompts(items);setSelectedSystemPromptId(id);setError('');
+  };
+  const loadSystemPrompt=id=>{
+    setSelectedSystemPromptId(id);
+    const item=savedSystemPrompts.find(saved=>saved.id===id);
+    if(item){setSystemPromptName(item.name);setSystemPrompt(item.content)}
+    else{setSystemPromptName('');setSystemPrompt('')}
+  };
+  const deleteSystemPrompt=()=>{
+    if(!selectedSystemPromptId)return;
+    persistSystemPrompts(savedSystemPrompts.filter(item=>item.id!==selectedSystemPromptId));
+    loadSystemPrompt('');
+  };
   const test=async()=>{
     setSending(true);setAnswer('');setError('');
     const userMessage=prompt.trim();
-    setChatMessages(current=>[...current,{role:'user',content:userMessage}]);
+    const nextMessages=[...chatMessages,{role:'user',content:userMessage}].slice(-10);
+    setChatMessages(nextMessages);setPrompt('');
     try{
       const result=await request('/v1/chat/completions',{method:'POST',body:JSON.stringify({
-        model:selectedModel,messages:[{role:'user',content:userMessage}],stream:false,
+        model:selectedModel,messages:sessionId?[{role:'user',content:userMessage}]:nextMessages,stream:false,
         session_id:saveSession?sessionId||null:null,store_session:saveSession&&!sessionId,
-        system_prompt:systemPrompt.trim()||null
+        system_prompt:systemPrompt.trim()||null,
+        gateway_options:{mode:executionMode,max_history_messages:10}
       })});
       const reply=result.choices?.[0]?.message?.content||'(empty)';
       setAnswer(reply);
-      setChatMessages(current=>[...current,{role:'assistant',content:reply}]);
+      setChatMessages(current=>[...current,{role:'assistant',content:reply}].slice(-10));
       if(result.session_id){setSessionId(result.session_id);setSaveSession(true)}
       await Promise.all([refresh(),refreshSessions()]);
-    }catch(e){setError(e.message)}finally{setSending(false)}
+    }catch(e){setError(e.message);setPrompt(userMessage);setChatMessages(current=>current.slice(0,-1))}finally{setSending(false)}
   };
   const deleteSession=async(id)=>{
     if(!window.confirm('ลบ session นี้พร้อมประวัติข้อความถาวรใช่ไหมคะ?'))return;
     try{
-      await request('/admin/sessions/'+encodeURIComponent(id),{method:'DELETE'});
+      const session=sessions.find(item=>item.id===id);
+      await request('/admin/sessions/'+encodeURIComponent(id)+'?mode='+(session?.mode||'agent'),{method:'DELETE'});
       if(sessionId===id){setSessionId('');setSaveSession(false);setAnswer('');setChatMessages([])}
       await Promise.all([refresh(),refreshSessions()]);
     }catch(e){setError(e.message)}
   };
-  const continueSession=async id=>{
-    setSessionId(id);setSaveSession(true);setAnswer('');setChatMessages([]);setError('');setHistoryLoading(true);
+  const continueSession=async(id,mode='agent')=>{
+    setSessionId(id);setSaveSession(true);setExecutionMode(mode);setAnswer('');setChatMessages([]);setError('');setHistoryLoading(true);
     document.getElementById('tester')?.scrollIntoView({behavior:'smooth'});
-    try{const history=await request('/admin/sessions/'+encodeURIComponent(id));setChatMessages(history.messages||[])}
+    try{const history=await request('/admin/sessions/'+encodeURIComponent(id)+'?mode='+mode);setChatMessages(history.messages||[])}
     catch(e){setError(e.message)}finally{setHistoryLoading(false)}
   };
   const formatDate=value=>value?new Date(typeof value==='number'&&value<1e12?value*1000:value).toLocaleString():'—';
@@ -88,15 +124,13 @@ function App(){
       {error&&<div className="alert">{error}</div>}
       <section className="stats"><article><span>Gateway</span><strong>{overview?'Connected':'Checking...'}</strong><small>Bearer-authenticated API</small></article><article><span>Queued</span><strong>{overview?.queue_depth??'—'}</strong><small>Redis pending queue</small></article><article><span>Running</span><strong>{counts.running??0}</strong><small>Active CLI requests</small></article><article><span>Saved Sessions</span><strong>{sessions.length}</strong><small>Stored in Worker Codex volume</small></article></section>
       <section className="panel" id="tester"><div className="section-title"><h2>Test Codex CLI</h2><span className="pill">{modelCatalog.length} models</span></div>
-        <label>Model</label><select value={selectedModel} onChange={e=>setSelectedModel(e.target.value)}>{modelCatalog.map(model=><option key={model.id} value={model.id}>{model.name||model.id}{model.is_default?' (default)':''}</option>)}</select>
-        <label className="session-toggle"><input type="checkbox" checked={saveSession} onChange={e=>{setSaveSession(e.target.checked);if(!e.target.checked)setSessionId('')}}/> Save this conversation as a Codex session</label>
-        {saveSession&&<div className="session-current">{sessionId?<>Continuing session <code>{sessionId}</code></>:<>A new session will be created with this request.</>} <button className="secondary" onClick={startSession}><Plus size={15}/> New session</button></div>}
-        <p>A system prompt guides Codex's behavior. Saved sessions include prompts and answers in Codex history files.</p>
-        <label>System prompt</label><textarea rows="3" value={systemPrompt} onChange={e=>setSystemPrompt(e.target.value)} placeholder="กำหนดบทบาท รูปแบบคำตอบ หรือข้อกำหนดให้ Codex"/>
-        {sessionId&&<div className="chat-transcript" aria-live="polite">{historyLoading?<p className="muted">Loading conversation…</p>:chatMessages.map((message,index)=><div className={'chat-bubble '+message.role} key={index}><small>{message.role==='assistant'?'Codex':'You'}</small><div>{message.content}</div></div>)}</div>}
-        <label>{sessionId?'Your next message':'User message'}</label><textarea rows="4" value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'&&!sending&&prompt.trim())test()}}/><button disabled={sending||!prompt.trim()} onClick={test}><Send size={16}/> {sending?'Running Codex...':sessionId?'Send Message':'Send Request'}</button>{sessionId&&<small className="composer-hint">Ctrl+Enter to send · This continues the selected session</small>}{!sessionId&&answer&&<pre className="answer">{answer}</pre>}
+        <div className="chat-toolbar"><div className="chat-selectors"><label>Mode<select value={executionMode} disabled={!!sessionId} onChange={e=>setExecutionMode(e.target.value)}><option value="chat">Chat · lightweight</option><option value="agent">Agent · full config</option></select></label><label>Model<select value={selectedModel} onChange={e=>setSelectedModel(e.target.value)}>{modelCatalog.map(model=><option key={model.id} value={model.id}>{model.name||model.id}{model.is_default?' (default)':''}</option>)}</select></label></div><div className="chat-actions"><label className="session-toggle"><input type="checkbox" checked={saveSession} onChange={e=>{setSaveSession(e.target.checked);if(!e.target.checked)setSessionId('')}}/> Save conversation</label><button className="secondary" onClick={newChat}><Plus size={15}/> New chat</button></div></div>
+        {sessionId&&<div className="session-current">Continuing session <code>{sessionId}</code><button className="secondary" onClick={startSession}><Plus size={15}/> New saved session</button></div>}
+        <details className="system-prompt-settings" open={!!systemPrompt}><summary>System prompt <span>{systemPrompt?'Configured':'Optional'}</span></summary><p>Guide Codex's role and response style. Saved prompt templates stay in this browser.</p><div className="saved-prompt-controls"><select aria-label="Saved system prompts" value={selectedSystemPromptId} onChange={e=>loadSystemPrompt(e.target.value)}><option value="">Choose a saved prompt</option>{savedSystemPrompts.map(item=><option key={item.id} value={item.id}>{item.name}</option>)}</select><input aria-label="Prompt name" value={systemPromptName} onChange={e=>setSystemPromptName(e.target.value)} placeholder="Name this prompt"/><button className="secondary" onClick={()=>saveSystemPrompt(false)}>{selectedSystemPromptId?'Update prompt':'Save prompt'}</button>{selectedSystemPromptId&&<button className="secondary" onClick={()=>saveSystemPrompt(true)}>Save as new</button>}<button className="ghost danger" disabled={!selectedSystemPromptId} onClick={deleteSystemPrompt} title="Delete saved prompt"><Trash2 size={15}/></button></div><textarea rows="3" value={systemPrompt} onChange={e=>setSystemPrompt(e.target.value)} placeholder="กำหนดบทบาท รูปแบบคำตอบ หรือข้อกำหนดให้ Codex"/></details>
+        <div className="chat-transcript" aria-live="polite" ref={chatTranscriptRef}>{historyLoading?<p className="empty-chat">Loading conversation…</p>:chatMessages.length?chatMessages.map((message,index)=><div className={'chat-bubble '+message.role} key={index}><small>{message.role==='assistant'?'Codex':'You'}</small><div>{message.content}</div></div>):<div className="empty-chat"><MessageCircle size={25}/><strong>Start a conversation</strong><span>Send a message to begin. Unsaved chats stay in this tab.</span></div>}{sending&&<div className="chat-bubble assistant typing"><small>Codex</small><div>Thinking…</div></div>}</div>
+        <div className="chat-composer"><textarea rows="2" value={prompt} onChange={e=>setPrompt(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing&&!sending&&prompt.trim()){e.preventDefault();test()}}} placeholder="Message Codex… (Enter to send, Shift+Enter for a new line)"/><button disabled={sending||!prompt.trim()} onClick={test} aria-label="Send message"><Send size={17}/>{sending?'Thinking':'Send'}</button></div><small className="composer-hint">{sessionId?'Continuing this saved session.':'Chat context is kept in this tab unless you save the conversation.'}</small>
       </section>
-      <section className="panel" id="sessions"><div className="section-title"><h2>Saved Sessions</h2><span className="muted">{sessions.length} found</span></div><p>Deleting a session removes its saved Codex history file.</p><div className="table-scroll"><table><thead><tr><th>Session ID</th><th>Last Updated</th><th>Model</th><th>Actions</th></tr></thead><tbody>{sessions.map(s=><tr key={s.id}><td title={s.id}>{s.id.slice(0,8)}</td><td>{formatDate(s.updated_at)}</td><td>{s.model||'—'}</td><td><button className="secondary session-action" onClick={()=>continueSession(s.id)}><MessageCircle size={15}/> Continue</button> <button className="ghost danger session-action" onClick={()=>deleteSession(s.id)} title="Delete session"><Trash2 size={16}/> Delete</button></td></tr>)}{!sessions.length&&<tr><td colSpan="4" className="empty">No saved sessions</td></tr>}</tbody></table></div></section>
+      <section className="panel" id="sessions"><div className="section-title"><h2>Saved Sessions</h2><span className="muted">{sessions.length} found</span></div><p>Deleting a session removes its saved Codex history file.</p><div className="table-scroll"><table><thead><tr><th>Session ID</th><th>Mode</th><th>Last Updated</th><th>Model</th><th>Actions</th></tr></thead><tbody>{sessions.map(s=><tr key={s.mode+':'+s.id}><td title={s.id}>{s.id.slice(0,8)}</td><td>{s.mode||'agent'}</td><td>{formatDate(s.updated_at)}</td><td>{s.model||'—'}</td><td><button className="secondary session-action" onClick={()=>continueSession(s.id,s.mode||'agent')}><MessageCircle size={15}/> Continue</button> <button className="ghost danger session-action" onClick={()=>deleteSession(s.id)} title="Delete session"><Trash2 size={16}/> Delete</button></td></tr>)}{!sessions.length&&<tr><td colSpan="5" className="empty">No saved sessions</td></tr>}</tbody></table></div></section>
       <section className="panel" id="jobs"><div className="section-title"><h2>Recent Jobs</h2><span className="muted">Expires automatically</span></div><div className="table-scroll"><table><thead><tr><th>Job ID</th><th>Status</th><th>Duration</th><th>Created</th></tr></thead><tbody>{(overview?.jobs||[]).map(j=><tr key={j.id}><td title={j.id}>{j.id.slice(0,8)}</td><td><span className={'status '+j.status}>{j.status}</span></td><td>{j.duration_ms!=null?Math.round(j.duration_ms/1000)+' s':'—'}</td><td>{formatDate(j.created_at)}</td></tr>)}{!overview?.jobs?.length&&<tr><td colSpan="4" className="empty">No jobs yet</td></tr>}</tbody></table></div></section>
       <footer><Server size={14}/> Local-first MVP · Session history is stored on disk · Do not expose publicly</footer>
     </main>
