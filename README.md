@@ -42,6 +42,17 @@ If `--device-auth` isn't allowed by the account, consult official Codex CLI sign
 
 Open **http://127.0.0.1:8088/**, unlock with the local Gateway API key, then chat in the tester. Unsaved chat context stays in browser memory and is sent with later turns; enable **Save conversation** to persist it as a Codex session and continue it later. Use **Continue** in the Sessions panel to load the saved history. Named System prompt templates are saved in this browser's `localStorage`; they are not uploaded until used in a request. Manage or delete saved sessions in the Sessions panel. The UI key stays in browser `sessionStorage` (cleared after closing the tab). This UI is **not** a separate login/account system.
 
+### Debugging incoming request JSON
+
+Request-body logging is disabled by default. To inspect JSON sent by n8n, set `LOG_REQUEST_BODIES=true` in `.env`, then recreate the API container:
+
+```powershell
+docker compose up -d --force-recreate api
+docker compose logs -f --tail 100 api
+```
+
+This logs bodies for `POST /v1/chat/completions` and `POST /v1/jobs` to the API container log, including prompts and system prompts. Authorization headers are not logged. Turn it off again after debugging by setting `LOG_REQUEST_BODIES=false` and recreating `api`; remove old container logs if they contain sensitive prompts.
+
 ## n8n integration
 
 1. Join n8n container to the gateway public network, or attach its Compose service to it:

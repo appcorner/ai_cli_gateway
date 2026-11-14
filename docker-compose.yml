@@ -17,6 +17,7 @@ services:
       JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-120}
       CHAT_WAIT_SECONDS: ${CHAT_WAIT_SECONDS:-90}
       JOB_TTL_SECONDS: ${JOB_TTL_SECONDS:-3600}
+      LOG_REQUEST_BODIES: ${LOG_REQUEST_BODIES:-false}
     depends_on:
       redis: {condition: service_healthy}
     networks: [gateway-internal, gateway-public]

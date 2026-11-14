@@ -1,6 +1,7 @@
 import asyncio
 import hmac
 import json
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -12,6 +13,8 @@ from .common import JOB_TTL_SECONDS, enqueue, fetch as _fetch, get_model_catalog
 API_KEY = os.getenv("GATEWAY_API_KEY", "")
 MODEL_DEFAULT = os.getenv("DEFAULT_MODEL", "")
 WAIT_SECONDS = max(1, min(int(os.getenv("CHAT_WAIT_SECONDS", "90")), 300))
+LOG_REQUEST_BODIES = os.getenv("LOG_REQUEST_BODIES", "false").lower() in ("1", "true", "yes", "on")
+logger = logging.getLogger("codex_gateway.request_debug")
 
 @asynccontextmanager
 async def lifespan(app):
@@ -19,6 +22,33 @@ async def lifespan(app):
     yield
 
 app = FastAPI(title="Personal Codex Gateway", version="0.1.0", lifespan=lifespan)
+
+@app.middleware("http")
+async def log_request_body(request, call_next):
+    if LOG_REQUEST_BODIES and request.method in ("POST", "PUT", "PATCH") and request.url.path in (
+        "/v1/chat/completions", "/v1/jobs"
+    ):
+        body = await request.body()
+        try:
+            payload = json.loads(body) if body else None
+            rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            rendered = body[:100000].decode("utf-8", errors="replace")
+        if len(rendered) > 100000:
+            rendered = rendered[:100000] + "…[truncated]"
+        logger.warning("request_body method=%s path=%s content_type=%s json=%s",
+                       request.method, request.url.path,
+                       request.headers.get("content-type", ""), rendered)
+        # Replay the consumed body so FastAPI can still parse it after this middleware.
+        replayed = False
+        async def replay_body():
+            nonlocal replayed
+            if replayed:
+                return {"type": "http.disconnect"}
+            replayed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        request._receive = replay_body
+    return await call_next(request)
 
 async def auth(authorization: str | None = Header(default=None)):
     if not API_KEY or not authorization or not authorization.startswith("Bearer "):
