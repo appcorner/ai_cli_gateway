@@ -7,6 +7,7 @@ function App(){
   const [token,setToken]=useState(sessionStorage.getItem('gatewayToken')||'');
   const [draft,setDraft]=useState('');
   const [overview,setOverview]=useState(null);
+  const [usage,setUsage]=useState(null);
   const [error,setError]=useState('');
   const [systemPrompt,setSystemPrompt]=useState('');
   const [prompt,setPrompt]=useState('');
@@ -38,6 +39,7 @@ function App(){
     if(!token)return;
     try{
       setOverview(await request('/admin/overview'));
+      try{setUsage(await request('/admin/usage'))}catch(e){setUsage({error:e.message})}
       setError('');
       try{const models=await request('/v1/models');setModelCatalog(models.data||[])}catch{}
     }catch(e){setError(e.message)}
@@ -117,12 +119,14 @@ function App(){
   if(!token)return <main className="login"><div className="login-card"><div className="brand"><Terminal size={28}/> Codex Gateway</div><p>Personal Management Console</p><label>Gateway API Key</label><input type="password" value={draft} onChange={e=>setDraft(e.target.value)} onKeyDown={e=>e.key==='Enter'&&login()} placeholder="Paste GATEWAY_API_KEY"/><button disabled={!draft.trim()} onClick={login}><Lock size={16}/> Unlock Console</button><small>Key is held only in this browser tab session. Access from localhost only.</small></div></main>;
 
   const counts=overview?.counts||{};
+  const usageWindow=(title,window)=>window?<article className="usage-window"><div><span>{title}</span><strong>{window.used_percent==null?'—':`${Math.max(0,100-window.used_percent)}% left`}</strong></div><div className="usage-track"><i style={{width:`${Math.min(100,Math.max(0,window.used_percent||0))}%`}}/></div><small>{window.used_percent==null?'Usage unavailable':`${window.used_percent}% used`}{window.window_duration_mins?` · ${Math.round(window.window_duration_mins/60)}h window`:''}{window.resets_at?` · resets ${formatDate(window.resets_at)}`:''}</small></article>:null;
   return <div className="layout">
     <aside><div className="brand"><Terminal size={24}/> Codex Gateway</div><p className="aside-sub">Personal LLM Router</p><nav><a href="#dashboard"><Activity size={17}/> Overview</a><a href="#tester"><Send size={17}/> Chat Tester</a><a href="#sessions"><Server size={17}/> Sessions</a><a href="#jobs"><ListTodo size={17}/> Jobs</a></nav><div className="aside-foot"><button className="ghost" onClick={logout}><LogOut size={16}/> Lock Console</button></div></aside>
     <main className="content">
       <header><div><h1 id="dashboard">Gateway Overview</h1><p>Codex CLI · FastAPI · Redis queue · File-based Codex sessions</p></div><button className="secondary" onClick={refresh}><RefreshCw size={15}/> Refresh</button></header>
       {error&&<div className="alert">{error}</div>}
       <section className="stats"><article><span>Gateway</span><strong>{overview?'Connected':'Checking...'}</strong><small>Bearer-authenticated API</small></article><article><span>Queued</span><strong>{overview?.queue_depth??'—'}</strong><small>Redis pending queue</small></article><article><span>Running</span><strong>{counts.running??0}</strong><small>Active CLI requests</small></article><article><span>Saved Sessions</span><strong>{sessions.length}</strong><small>Stored in Worker Codex volume</small></article></section>
+      <section className="panel usage-panel"><div className="section-title"><h2>Codex Usage Limits</h2><span className="muted">{usage?.fetched_at?`Updated ${formatDate(usage.fetched_at)}`:'Account status'}</span></div>{usage?.error?<p className="usage-note">Could not read usage limits. Check Codex sign-in and refresh.</p>:usage?.primary||usage?.secondary?<div className="usage-grid">{usageWindow('Current limit',usage.primary)}{usageWindow('Weekly limit',usage.secondary)}</div>:<p className="usage-note">Loading usage limits from the signed-in Codex account…</p>}</section>
       <section className="panel" id="tester"><div className="section-title"><h2>Test Codex CLI</h2><span className="pill">{modelCatalog.length} models</span></div>
         <div className="chat-toolbar"><div className="chat-selectors"><label>Mode<select value={executionMode} disabled={!!sessionId} onChange={e=>setExecutionMode(e.target.value)}><option value="chat">Chat · lightweight</option><option value="agent">Agent · full config</option></select></label><label>Model<select value={selectedModel} onChange={e=>setSelectedModel(e.target.value)}>{modelCatalog.map(model=><option key={model.id} value={model.id}>{model.name||model.id}{model.is_default?' (default)':''}</option>)}</select></label></div><div className="chat-actions"><label className="session-toggle"><input type="checkbox" checked={saveSession} onChange={e=>{setSaveSession(e.target.checked);if(!e.target.checked)setSessionId('')}}/> Save conversation</label><button className="secondary" onClick={newChat}><Plus size={15}/> New chat</button></div></div>
         {sessionId&&<div className="session-current">Continuing session <code>{sessionId}</code><button className="secondary" onClick={startSession}><Plus size={15}/> New saved session</button></div>}

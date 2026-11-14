@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -162,6 +163,18 @@ def overview():
 @app.get("/admin/jobs/{job_id}", dependencies=[Depends(auth)])
 def admin_job(job_id: str):
     return {**fetch(job_id), "events": []}
+
+@app.get("/admin/usage", dependencies=[Depends(auth)])
+def usage():
+    cached = redis_client.get("codex:usage-limits")
+    if cached:
+        return json.loads(cached)
+    try:
+        result = session_control("usage", timeout_seconds=30)
+        redis_client.setex("codex:usage-limits", 60, json.dumps(result))
+        return result
+    except Exception as exc:
+        raise HTTPException(503, f"Could not read Codex usage limits: {type(exc).__name__}") from exc
 
 @app.get("/admin/sessions", dependencies=[Depends(auth)])
 def admin_sessions():

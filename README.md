@@ -12,7 +12,7 @@ Private Docker-based HTTP gateway for **one user**: n8n -> FastAPI -> Redis -> w
 - When session saving is enabled, Codex stores the full conversation (system instructions, prompts and answers) as local session history files in the worker's persistent `codex_auth` volume. Session history is not copied into Redis or another database. Delete a session from the Web Console to remove its Codex history files.
 - Saved sessions have no automatic expiration; remove them from the Dashboard when they are no longer needed.
 - Results, status, and non-sensitive job metadata are kept in Redis memory for `JOB_TTL_SECONDS` (default one hour), then expire.
-- The system has **no provider-side subscription quota API** and cannot determine remaining subscription allowance; rate-limit errors surface as failed jobs.
+- The Dashboard reads Codex account rate-limit windows through the Codex app-server and refreshes the snapshot at most once per minute. Availability depends on the signed-in account and installed Codex CLI; this is not per-request token accounting.
 
 ## Prerequisites
 

@@ -337,6 +337,23 @@ def run_session_turn(prompt, model, session_id=None, system_prompt=None, store_s
 def perform_session_control(operation, session_id=None, mode="agent"):
     process, incoming = initialized_app_server(mode)
     try:
+        if operation == "usage":
+            response = send_rpc(process, incoming, 2, "account/rateLimits/read", {})
+            limits = response.get("rateLimits", response.get("rate_limits", {}))
+            def normalize_window(window):
+                if not window:
+                    return None
+                return {
+                    "used_percent": window.get("usedPercent", window.get("used_percent")),
+                    "window_duration_mins": window.get("windowDurationMins", window.get("window_duration_mins")),
+                    "resets_at": window.get("resetsAt", window.get("resets_at")),
+                }
+            return {
+                "plan_type": response.get("planType", response.get("plan_type")),
+                "primary": normalize_window(limits.get("primary")),
+                "secondary": normalize_window(limits.get("secondary")),
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+            }
         if operation == "list":
             sessions = []
             cursor = None
