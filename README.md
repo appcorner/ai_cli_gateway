@@ -122,7 +122,7 @@ networks:
 ## API
 
 - `GET /health` — dependency status, not authenticated (only localhost-published)
-- `GET /v1/models?provider=codex|agy` — provider default alias plus that CLI's model catalog (cached in Redis for five minutes); omitted provider defaults to Codex
+- `GET /v1/models` — both providers' default aliases and model catalogs (cached in Redis for five minutes). Model IDs are provider-qualified as `codex:<model-id>` or `agy:<model-id>` so clients can select a model without a separate provider field. Optional `?provider=codex|agy` filters the list.
 - `POST /v1/chat/completions` — synchronous, returns OpenAI-like subset
 - `POST /v1/jobs` — enqueue asynchronous task
 - `GET /v1/jobs/{id}` — job status/result
@@ -131,20 +131,20 @@ networks:
 - `GET /admin/sessions`, `GET /admin/sessions/{session_id}`, and `DELETE /admin/sessions/{session_id}` — list and continue Codex or Antigravity sessions; Codex sessions can also be deleted
 
 Every route except `/health` requires the shared bearer key.
-Model discovery runs through the selected authenticated CLI. The list is a catalog, not a guarantee that the account can use every entry; the selected model is verified by the next request. Add `"provider":"agy"` to a chat or job request to use Antigravity. Existing clients that omit `provider` continue to use Codex.
+Model discovery runs through both authenticated CLIs. The list is a catalog, not a guarantee that the account can use every entry; the selected model is verified by the next request. Selecting an ID with the `agy:` prefix automatically routes a chat or job request to Antigravity; `codex:` routes to Codex. The legacy `agy-default` alias also selects Antigravity. If `provider` is supplied, it must match the model ID prefix. An unqualified model ID with no provider continues to default to Codex.
 `gateway_options.mode` selects `chat` (default) or `agent` for Codex, and `chat` (default) or `agent` (shown as Normal in the tester) for agy. Codex Chat mode uses a clean `CODEX_HOME`, disables user/project extensions, bundled Skills and web search, sets reasoning/verbosity low, and limits stateless request history. Agy Chat mode disables headless slash-command handling; core instructions and global/plugin rules can still add context. Agy Normal mode enables normal slash-command and skill behavior. The Chat Tester shows the provider-specific mode selector.
 
 To save a conversation, set `store_session: true` on its first `/v1/chat/completions` request. The response includes `session_id`; pass that ID on subsequent calls to continue the same Codex thread. Also pass the same `gateway_options.mode` on subsequent calls. If session history is not wanted, omit both fields and each request remains ephemeral.
 Set `system_prompt` to provide Codex developer instructions separately from the user message. The Chat Tester exposes this as a dedicated field. If omitted, normal stateless requests continue to use `codex exec`.
 
 ```json
-{"provider":"agy","model":"agy-default","store_session":true,"messages":[{"role":"user","content":"Help plan this work"}]}
+{"model":"agy-default","store_session":true,"messages":[{"role":"user","content":"Help plan this work"}]}
 ```
 
 Use the returned `session_id` on the next request:
 
 ```json
-{"provider":"agy","model":"agy-default","session_id":"CONVERSATION_ID_FROM_PREVIOUS_RESPONSE","messages":[{"role":"user","content":"Explain the first step"}]}
+{"model":"agy-default","session_id":"CONVERSATION_ID_FROM_PREVIOUS_RESPONSE","messages":[{"role":"user","content":"Explain the first step"}]}
 ```
 
 ### Asynchronous example

@@ -11,7 +11,7 @@
         "sendHeaders": true,
         "headerParameters": {"parameters": [{"name":"Authorization","value":"=Bearer {{$env.GATEWAY_API_KEY}}"},{"name":"Content-Type","value":"application/json"}]},
         "sendBody": true, "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({model: 'codex-default', messages: [{role:'user', content: $json.body?.message || 'สวัสดีครับ'}], stream: false}) }}",
+        "jsonBody": "={{ {model: 'codex-default', messages: [{role:'user', content: $json.body?.message || 'สวัสดีค่ะ'}], stream: false} }}",
         "options": {"timeout": 130000}
       },
       "id": "3b8e3c67-7136-450b-8a2d-cb2d0af02911", "name": "Codex HTTP", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [440,300]

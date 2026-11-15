@@ -44,8 +44,17 @@ def workspace_temporary_directory(prefix):
 class ProviderApiTests(unittest.TestCase):
     def test_omitted_provider_keeps_codex_default(self):
         request = api.ChatRequest(messages=[{"role": "user", "content": "hello"}])
-        self.assertEqual(request.provider, "codex")
+        self.assertIsNone(request.provider)
         self.assertEqual(request.model, "codex-default")
+
+    def test_provider_is_inferred_from_qualified_model_id(self):
+        self.assertEqual(api.resolve_provider("agy:gemini-4-argon-high"), "agy")
+        self.assertEqual(api.normalized_model("agy:gemini-4-argon-high"), "gemini-4-argon-high")
+        self.assertEqual(api.resolve_provider("codex:o4-mini"), "codex")
+
+    def test_model_prefix_must_match_explicit_provider(self):
+        with self.assertRaises(api.HTTPException):
+            api.resolve_provider("agy:gemini-4-argon-high", "codex")
 
     def test_agy_default_alias_and_configured_model(self):
         with patch.object(api, "AGY_MODEL_DEFAULT", "gemini-3.8-flash-medium"):
@@ -58,8 +67,19 @@ class ProviderApiTests(unittest.TestCase):
         with patch.object(api, "get_model_catalog", return_value=[{"id": "gemini-4-argon-high", "name": "Gemini 4 Argon"}]) as catalog:
             response = api.models(provider="agy")
         self.assertEqual(response["data"][0]["id"], "agy-default")
+        self.assertEqual(response["data"][1]["id"], "agy:gemini-4-argon-high")
         self.assertEqual(response["data"][1]["owned_by"], "agy")
         catalog.assert_called_once_with("agy")
+
+    def test_model_catalog_without_provider_combines_both_providers(self):
+        def catalog(provider):
+            return [{"id": f"{provider}-sample", "name": f"{provider} sample"}]
+        with patch.object(api, "get_model_catalog", side_effect=catalog) as get_catalog:
+            response = api.models()
+        self.assertEqual([item["id"] for item in response["data"]], [
+            "codex-default", "codex:codex-sample", "agy-default", "agy:agy-sample",
+        ])
+        self.assertEqual(get_catalog.call_count, 2)
 
     def test_models_http_route_accepts_agy_provider(self):
         client = TestClient(api.app)
@@ -68,7 +88,7 @@ class ProviderApiTests(unittest.TestCase):
             response = client.get("/v1/models?provider=agy", headers={"Authorization": "Bearer test-key"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["data"][0]["id"], "agy-default")
-        self.assertEqual(response.json()["data"][1]["id"], "gemini-4-argon-high")
+        self.assertEqual(response.json()["data"][1]["id"], "agy:gemini-4-argon-high")
 
 
 class AgyWorkerTests(unittest.TestCase):

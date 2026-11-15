@@ -67,7 +67,7 @@ class GatewayOptions(BaseModel):
     max_history_messages: int = Field(default=10, ge=1, le=50)
 
 class ChatRequest(BaseModel):
-    provider: Literal["codex", "agy"] = "codex"
+    provider: Literal["codex", "agy"] | None = None
     model: str = "codex-default"
     messages: list[Message] = Field(min_length=1, max_length=50)
     stream: bool = False
@@ -77,7 +77,7 @@ class ChatRequest(BaseModel):
     gateway_options: GatewayOptions | None = None
 
 class JobRequest(BaseModel):
-    provider: Literal["codex", "agy"] = "codex"
+    provider: Literal["codex", "agy"] | None = None
     prompt: str = Field(min_length=1, max_length=60000)
     model: str = "codex-default"
     session_id: str | None = None
@@ -85,7 +85,23 @@ class JobRequest(BaseModel):
     system_prompt: str | None = Field(default=None, max_length=20000)
     gateway_options: GatewayOptions | None = None
 
-def normalized_model(model: str, provider: str = "codex"):
+def resolve_provider(model: str, provider: str | None = None):
+    if model.startswith("codex:"):
+        inferred = "codex"
+    elif model.startswith("agy:"):
+        inferred = "agy"
+    elif model == "agy-default":
+        inferred = "agy"
+    else:
+        inferred = "codex"
+    if provider and model.startswith(("codex:", "agy:")) and provider != inferred:
+        raise HTTPException(400, "Model provider prefix does not match provider field")
+    return provider or inferred
+
+def normalized_model(model: str, provider: str | None = None):
+    provider = resolve_provider(model, provider)
+    if model.startswith(("codex:", "agy:")):
+        model = model.split(":", 1)[1]
     if model in (f"{provider}-default", "default", "codex-default"):
         return (AGY_MODEL_DEFAULT if provider == "agy" else MODEL_DEFAULT) or None
     try:
@@ -93,7 +109,7 @@ def normalized_model(model: str, provider: str = "codex"):
             return model
     except Exception as exc:
         raise HTTPException(503, f"{provider} model catalog unavailable: {type(exc).__name__}") from exc
-    raise HTTPException(400, f"Model must be {provider}-default or a model returned by /v1/models?provider={provider}")
+    raise HTTPException(400, "Model must be a gateway model ID returned by /v1/models")
 
 def fetch(job_id: str):
     job = _fetch(job_id)
@@ -110,25 +126,30 @@ def health():
         raise HTTPException(503, "Dependencies unavailable")
 
 @app.get("/v1/models", dependencies=[Depends(auth)])
-def models(provider: Literal["codex", "agy"] = "codex"):
-    try:
-        catalog = get_model_catalog(provider)
-    except Exception as exc:
-        raise HTTPException(503, f"Could not load {provider} model catalog: {type(exc).__name__}") from exc
-    default_id = "codex-default" if provider == "codex" else "agy-default"
-    data = [{"id": default_id, "object": "model", "owned_by": f"local-{provider}",
-             "description": f"Gateway alias for the configured {provider} default model"}]
-    data.extend({"id": item["id"], "object": "model", "owned_by": provider,
-                 "name": item.get("name", item["id"]), "is_default": item.get("is_default", False)}
-                for item in catalog)
+def models(provider: Literal["codex", "agy"] | None = None):
+    providers = [provider] if provider else ["codex", "agy"]
+    data = []
+    for item_provider in providers:
+        try:
+            catalog = get_model_catalog(item_provider)
+        except Exception as exc:
+            raise HTTPException(503, f"Could not load {item_provider} model catalog: {type(exc).__name__}") from exc
+        default_id = f"{item_provider}-default"
+        data.append({"id": default_id, "object": "model", "owned_by": f"local-{item_provider}",
+                     "name": f"{item_provider.title()} default",
+                     "description": f"Gateway alias for the configured {item_provider} default model"})
+        data.extend({"id": f"{item_provider}:{item['id']}", "object": "model", "owned_by": item_provider,
+                     "name": item.get("name", item["id"]), "is_default": item.get("is_default", False)}
+                    for item in catalog)
     return {"object": "list", "data": data}
 
 @app.post("/v1/jobs", dependencies=[Depends(auth)], status_code=202)
 def submit(req: JobRequest):
+    provider = resolve_provider(req.model, req.provider)
     mode = req.gateway_options.mode if req.gateway_options else (
-        "chat" if req.provider == "agy" else ("agent" if req.session_id else "chat"))
-    return {"id": enqueue(req.prompt, normalized_model(req.model, req.provider), req.session_id,
-                           req.store_session, req.system_prompt, mode, req.provider), "status": "queued"}
+        "chat" if provider == "agy" else ("agent" if req.session_id else "chat"))
+    return {"id": enqueue(req.prompt, normalized_model(req.model, provider), req.session_id,
+                           req.store_session, req.system_prompt, mode, provider), "status": "queued"}
 
 @app.get("/v1/jobs/{job_id}", dependencies=[Depends(auth)])
 def job_status(job_id: str):
@@ -136,8 +157,9 @@ def job_status(job_id: str):
 
 @app.post("/v1/chat/completions", dependencies=[Depends(auth)])
 async def chat(req: ChatRequest):
+    provider = resolve_provider(req.model, req.provider)
     mode = req.gateway_options.mode if req.gateway_options else (
-        "chat" if req.provider == "agy" else ("agent" if req.session_id else "chat"))
+        "chat" if provider == "agy" else ("agent" if req.session_id else "chat"))
     max_history_messages = req.gateway_options.max_history_messages if req.gateway_options else 10
     if req.stream:
         raise HTTPException(400, "Streaming is not supported in MVP")
@@ -167,14 +189,14 @@ async def chat(req: ChatRequest):
             prompt += "\nReply to the most recent user turn."
     if len(prompt) > 60000:
         raise HTTPException(413, "Conversation too long")
-    job_id = await asyncio.to_thread(enqueue, prompt, normalized_model(req.model, req.provider), req.session_id,
-                                     req.store_session, system_prompt, mode, req.provider)
+    job_id = await asyncio.to_thread(enqueue, prompt, normalized_model(req.model, provider), req.session_id,
+                                     req.store_session, system_prompt, mode, provider)
     deadline = time.monotonic() + WAIT_SECONDS
     while time.monotonic() < deadline:
         j = await asyncio.to_thread(fetch, job_id)
         if j["status"] == "completed":
             return {"id": "chatcmpl-" + job_id, "object": "chat.completion", "created": int(time.time()),
-                    "model": req.model, "provider": req.provider, "session_id": j.get("session_id"),
+                    "model": req.model, "provider": provider, "session_id": j.get("session_id"),
                     "usage": j.get("usage"),
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": j["result"]}, "finish_reason": "stop"}]}
         if j["status"] in ("failed", "cancelled"):
