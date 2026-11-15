@@ -355,22 +355,9 @@ def record_agy_session_turn(session_id, prompt, answer, model=None, mode="chat")
 
 def list_agy_sessions():
     sessions = read_agy_session_index()
-    # Older gateway-created conversations can be recovered from Antigravity's
-    # documented workspace-to-last-conversation cache.
-    cache_path = os.path.join(agy_cli_home(), "cache", "last_conversations.json")
-    try:
-        with open(cache_path, encoding="utf-8") as cache_file:
-            workspace_sessions = json.load(cache_file)
-        if isinstance(workspace_sessions, dict):
-            for workspace, session_id in workspace_sessions.items():
-                workspace_name = str(workspace).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-                if workspace_name.startswith("agy-job-") and isinstance(session_id, str) and session_id:
-                    sessions.setdefault(session_id, {
-                        "id": session_id, "provider": "agy", "created_at": "", "updated_at": "",
-                        "model": "", "mode": "chat", "title": "Imported Antigravity conversation", "messages": [],
-                    })
-    except (OSError, json.JSONDecodeError):
-        pass
+    # The CLI also records last_conversations entries for unsaved, one-shot
+    # gateway runs. Only the gateway index represents sessions the user chose
+    # to save, so listing the CLI cache would leak those into Saved CLI Sessions.
     return sorted(sessions.values(), key=lambda item: item.get("updated_at") or "", reverse=True)
 
 
