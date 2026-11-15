@@ -9,7 +9,7 @@ Private Docker-based HTTP gateway for **one user**: n8n -> FastAPI -> Redis -> w
 - The OpenAI-like chat endpoint is deliberately a **subset**: text messages only, no streaming, tool calls, images, embeddings, or reliable token accounting. Requests are stateless unless `store_session` or an existing `session_id` is supplied.
 - API key is shared by the local browser and n8n. Only use on a trusted machine. Never publish port 8088 externally or expose the Docker public network to untrusted containers.
 - Prompts are held in Redis memory while queued and removed when a worker claims the job. Redis persistence is disabled and it has no data volume, so queued jobs and job history are lost if Redis restarts.
-- When session saving is enabled, Codex stores the full conversation (system instructions, prompts and answers) as local session history files in the worker's persistent `codex_auth` volume. Session history is not copied into Redis or another database. Delete a session from the Web Console to remove its Codex history files.
+- When session saving is enabled, Codex stores the full conversation (system instructions, prompts and answers) in the worker's persistent `codex_auth` volume. Antigravity stores its native conversation in `agy_auth`; the Gateway keeps up to 80 user/assistant transcript messages per saved conversation in `gateway_sessions.json` in the same volume. Redis is not used for persistent session history. Delete a session from the Web Console to remove its provider history and Gateway transcript.
 - Saved sessions have no automatic expiration; remove them from the Dashboard when they are no longer needed.
 - Results, status, and non-sensitive job metadata are kept in Redis memory for `JOB_TTL_SECONDS` (default one hour), then expire.
 - The Dashboard reads Codex account rate-limit windows through the Codex app-server. `agy` account usage is not shown by this gateway.
@@ -42,7 +42,7 @@ curl -sS http://127.0.0.1:8088/v1/chat/completions \
 
 If `--device-auth` isn't allowed by the account, consult official Codex CLI sign-in instructions for your installation; do not paste or publish session tokens. `codex login` is another supported interactive sign-in route when a browser callback is available.
 
-Open **http://127.0.0.1:8088/**, unlock with the local Gateway API key, then select Codex or Antigravity CLI in the tester. Unsaved chat context stays in browser memory and is sent with later turns. **Save conversation** returns a provider session ID that can be continued by passing it on later requests. The Sessions manager currently lists and manages Codex sessions only; `agy` conversation IDs can be resumed but are not listed or deleted by the console. Named System prompt templates are saved in this browser's `localStorage`; they are not uploaded until used. The UI key stays in browser `sessionStorage` (cleared after closing the tab). This UI is **not** a separate login/account system.
+Open **http://127.0.0.1:8088/**, unlock with the local Gateway API key, then select Codex or Antigravity CLI in the tester. Unsaved chat context stays in browser memory and is sent with later turns. **Save conversation** returns a provider session ID that can be continued from Sessions. The manager lists and manages sessions for both providers. Named System prompt templates are saved in this browser's `localStorage`; they are not uploaded until used. The UI key stays in browser `sessionStorage` (cleared after closing the tab). This UI is **not** a separate login/account system.
 
 ### Antigravity (`agy`) authentication
 
@@ -97,11 +97,11 @@ networks:
 - `GET /v1/jobs/{id}` — job status/result
 - `GET /admin/overview` — job counts/last 20 jobs
 - `GET /admin/jobs/{id}` — diagnostic event summaries
-- `GET /admin/sessions`, `GET /admin/sessions/{session_id}`, and `DELETE /admin/sessions/{session_id}` — list, read history, or permanently delete saved Codex sessions
+- `GET /admin/sessions`, `GET /admin/sessions/{session_id}`, and `DELETE /admin/sessions/{session_id}` — list and continue Codex or Antigravity sessions; Codex sessions can also be deleted
 
 Every route except `/health` requires the shared bearer key.
 Model discovery runs through the selected authenticated CLI. The list is a catalog, not a guarantee that the account can use every entry; the selected model is verified by the next request. Add `"provider":"agy"` to a chat or job request to use Antigravity. Existing clients that omit `provider` continue to use Codex.
-`gateway_options.mode` selects `chat` (default) or `agent`. Chat mode uses a clean `CODEX_HOME` containing only the shared sign-in file, disables user/project extensions, bundled Skills and web search, sets reasoning/verbosity low, and limits stateless request history to the last 10 messages (adjustable up to 50). Codex's built-in agent runtime instructions still apply. Agent mode uses the regular Codex home/configuration. The Chat Tester has the same mode selector.
+`gateway_options.mode` selects `chat` (default) or `agent` for Codex, and `chat` (default) or `agent` (shown as Normal in the tester) for agy. Codex Chat mode uses a clean `CODEX_HOME`, disables user/project extensions, bundled Skills and web search, sets reasoning/verbosity low, and limits stateless request history. Agy Chat mode disables headless slash-command handling; core instructions and global/plugin rules can still add context. Agy Normal mode enables normal slash-command and skill behavior. The Chat Tester shows the provider-specific mode selector.
 
 To save a conversation, set `store_session: true` on its first `/v1/chat/completions` request. The response includes `session_id`; pass that ID on subsequent calls to continue the same Codex thread. Also pass the same `gateway_options.mode` on subsequent calls. If session history is not wanted, omit both fields and each request remains ephemeral.
 Set `system_prompt` to provide Codex developer instructions separately from the user message. The Chat Tester exposes this as a dedicated field. If omitted, normal stateless requests continue to use `codex exec`.

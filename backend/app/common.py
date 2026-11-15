@@ -38,9 +38,14 @@ def fetch(job_id: str):
     job = redis_client.hgetall(f"codex:job:{job_id}")
     if not job:
         return None
+    try:
+        usage = json.loads(job.get("agy_usage") or "") or None
+    except json.JSONDecodeError:
+        usage = None
     return {"id": job["id"], "status": job["status"], "model": job.get("model") or None,
             "provider": job.get("provider") or "codex",
             "session_id": job.get("session_id") or None,
+            "usage": usage,
             "result": job.get("result") or None, "error": job.get("error") or None,
             "duration_ms": int(job["duration_ms"]) if job.get("duration_ms") else None,
             "created_at": job.get("created_at") or None, "finished_at": job.get("finished_at") or None}
@@ -73,10 +78,10 @@ def get_model_catalog(provider: str = "codex", timeout_seconds: int = 100):
 
 
 def session_control(operation: str, session_id: str | None = None, mode: str = "agent",
-                    timeout_seconds: int = 100):
+                    timeout_seconds: int = 100, provider: str = "codex"):
     request_id = str(uuid.uuid4())
-    response_key = f"codex:session:response:{request_id}"
-    redis_client.lpush("codex:session:requests", json.dumps({
+    response_key = f"{provider}:session:response:{request_id}"
+    redis_client.lpush(f"{provider}:session:requests", json.dumps({
         "request_id": request_id, "operation": operation, "session_id": session_id, "mode": mode
     }))
     deadline = time.monotonic() + timeout_seconds

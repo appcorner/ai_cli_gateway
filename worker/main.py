@@ -2,6 +2,8 @@ import json
 import os
 import re
 import queue
+import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -18,6 +20,8 @@ JOB_TTL_SECONDS = max(60, int(os.environ.get("JOB_TTL_SECONDS", "3600")))
 CODEX_HOME = os.environ.get("CODEX_HOME", "/home/node/.codex")
 CHAT_CODEX_HOME = os.path.join(CODEX_HOME, "chat-mode")
 CHAT_HOME_LOCK = threading.Lock()
+AGY_SESSION_LOCK = threading.Lock()
+AGY_SESSION_MESSAGE_LIMIT = 80
 CHAT_CONFIG = '''model_reasoning_effort = "low"
 model_verbosity = "low"
 model_reasoning_summary = "none"
@@ -89,13 +93,16 @@ def execute(job_id):
     system_prompt = job.get("system_prompt") or None
     mode = job.get("mode") or "chat"
     provider = job.get("provider") or "codex"
+    usage = None
     result = None
     error = None
     status = "failed"
     if provider == "agy":
         try:
-            result, session_id = run_agy_turn(prompt, model, session_id, system_prompt,
-                                              store_session or bool(session_id))
+            result, session_id, usage = run_agy_turn(prompt, model, session_id, system_prompt,
+                                                      store_session or bool(session_id), mode)
+            if session_id and (store_session or job.get("session_id")):
+                record_agy_session_turn(session_id, prompt, result, model, mode)
             status = "completed" if result else "failed"
             if not result:
                 error = "agy returned no answer"
@@ -151,6 +158,7 @@ def execute(job_id):
     if redis.exists(key):
         redis.hset(key, mapping={"status": status, "result": result or "", "error": error or "",
                                 "session_id": session_id or "",
+                                "agy_usage": json.dumps(usage) if usage else "",
                                 "duration_ms": duration_ms,
                                 "finished_at": datetime.now(timezone.utc).isoformat()})
         redis.expire(key, JOB_TTL_SECONDS)
@@ -249,13 +257,15 @@ def read_models_from_agy():
     return models
 
 
-def run_agy_turn(prompt, model, session_id=None, system_prompt=None, persist=False):
+def run_agy_turn(prompt, model, session_id=None, system_prompt=None, persist=False, mode="chat"):
     prompt = f"User request:\n{prompt}"
     if system_prompt:
         prompt = f"System instructions:\n{system_prompt}\n\n{prompt}"
     with tempfile.TemporaryDirectory(prefix="agy-job-") as workdir:
         command = ["agy", "--input-format", "stream-json", "--output-format", "stream-json",
-                   "--print-timeout", f"{TIMEOUT}s", "--sandbox", "--disable-slash-commands"]
+                   "--print-timeout", f"{TIMEOUT}s", "--sandbox"]
+        if mode == "chat":
+            command.append("--disable-slash-commands")
         if model:
             command.extend(["--model", model])
         if session_id:
@@ -279,7 +289,145 @@ def run_agy_turn(prompt, model, session_id=None, system_prompt=None, persist=Fal
         raise RuntimeError("agy did not complete successfully")
     answer = (envelope.get("response") or "").strip()
     conversation_id = envelope.get("conversation_id") if persist else None
-    return answer, conversation_id
+    return answer, conversation_id, envelope.get("usage") or {}
+
+
+def agy_cli_home():
+    return os.path.join(os.environ.get("HOME", "/home/node"), ".gemini", "antigravity-cli")
+
+
+def agy_session_index_path():
+    return os.path.join(agy_cli_home(), "gateway_sessions.json")
+
+
+def read_agy_session_index():
+    try:
+        with open(agy_session_index_path(), encoding="utf-8") as index_file:
+            payload = json.load(index_file)
+        sessions = payload.get("sessions", {}) if isinstance(payload, dict) else {}
+        return sessions if isinstance(sessions, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError):
+        print("agy session index could not be read", flush=True)
+        return {}
+
+
+def write_agy_session_index(sessions):
+    path = agy_session_index_path()
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    temporary_path = path + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as index_file:
+        json.dump({"sessions": sessions}, index_file, ensure_ascii=False)
+    os.chmod(temporary_path, 0o600)
+    os.replace(temporary_path, path)
+
+
+def record_agy_session_turn(session_id, prompt, answer, model=None, mode="chat"):
+    now = datetime.now(timezone.utc).isoformat()
+    with AGY_SESSION_LOCK:
+        sessions = read_agy_session_index()
+        session = sessions.get(session_id) or {
+            "id": session_id, "provider": "agy", "created_at": now,
+            "updated_at": now, "model": model or "", "mode": mode, "title": "",
+            "messages": [],
+        }
+        messages = session.get("messages", [])
+        if not session.get("title"):
+            session["title"] = next((line.strip() for line in prompt.splitlines() if line.strip()), "")[:160]
+        messages.extend([{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}])
+        session.update({"provider": "agy", "updated_at": now, "model": model or session.get("model") or "",
+                        "mode": mode,
+                        "messages": messages[-AGY_SESSION_MESSAGE_LIMIT:]})
+        sessions[session_id] = session
+        write_agy_session_index(sessions)
+
+
+def list_agy_sessions():
+    sessions = read_agy_session_index()
+    # Older gateway-created conversations can be recovered from Antigravity's
+    # documented workspace-to-last-conversation cache.
+    cache_path = os.path.join(agy_cli_home(), "cache", "last_conversations.json")
+    try:
+        with open(cache_path, encoding="utf-8") as cache_file:
+            workspace_sessions = json.load(cache_file)
+        if isinstance(workspace_sessions, dict):
+            for workspace, session_id in workspace_sessions.items():
+                workspace_name = str(workspace).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+                if workspace_name.startswith("agy-job-") and isinstance(session_id, str) and session_id:
+                    sessions.setdefault(session_id, {
+                        "id": session_id, "provider": "agy", "created_at": "", "updated_at": "",
+                        "model": "", "mode": "chat", "title": "Imported Antigravity conversation", "messages": [],
+                    })
+    except (OSError, json.JSONDecodeError):
+        pass
+    return sorted(sessions.values(), key=lambda item: item.get("updated_at") or "", reverse=True)
+
+
+def agy_session_control(operation, session_id=None):
+    if operation == "list":
+        return list_agy_sessions()
+    if operation == "history" and session_id:
+        session = read_agy_session_index().get(session_id)
+        return {"id": session_id, "provider": "agy", "messages": session.get("messages", []) if session else []}
+    if operation == "delete" and session_id:
+        return delete_agy_session(session_id)
+    raise ValueError("Unsupported Antigravity session operation")
+
+
+def delete_agy_session(session_id):
+    # Antigravity does not expose a headless delete command. Remove this exact
+    # conversation from its per-session SQLite store and picker index.
+    if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", session_id):
+        raise ValueError("Invalid Antigravity conversation ID")
+    root = agy_cli_home()
+    session_db = os.path.join(root, "conversations", session_id + ".db")
+    summary_db = os.path.join(root, "conversation_summaries.db")
+    if not os.path.isfile(session_db):
+        raise FileNotFoundError("Antigravity conversation database was not found")
+    if os.path.isfile(summary_db):
+        with sqlite3.connect(summary_db, timeout=10) as connection:
+            tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            for (table_name,) in tables:
+                columns = connection.execute(f'PRAGMA table_info("{table_name.replace(chr(34), chr(34)*2)}")').fetchall()
+                id_columns = [column[1] for column in columns
+                              if column[1].lower() in ("conversation_id", "conversationid", "id")]
+                for column in id_columns:
+                    safe_table = table_name.replace('"', '""')
+                    safe_column = column.replace('"', '""')
+                    connection.execute(f'DELETE FROM "{safe_table}" WHERE "{safe_column}" = ?', (session_id,))
+    for suffix in ("", "-wal", "-shm"):
+        path = session_db + suffix
+        if os.path.isfile(path):
+            os.remove(path)
+    for folder in ("brain", "annotations", "presence"):
+        path = os.path.join(root, folder, session_id)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.isfile(path):
+            os.remove(path)
+        for extension in (".pb", ".pbtxt", ".json"):
+            metadata_path = os.path.join(root, folder, session_id + extension)
+            if os.path.isfile(metadata_path):
+                os.remove(metadata_path)
+    cache_path = os.path.join(root, "cache", "last_conversations.json")
+    try:
+        with open(cache_path, encoding="utf-8") as cache_file:
+            cache = json.load(cache_file)
+        if isinstance(cache, dict):
+            cache = {workspace: conversation for workspace, conversation in cache.items()
+                     if conversation != session_id}
+            temporary_path = cache_path + ".tmp"
+            with open(temporary_path, "w", encoding="utf-8") as cache_file:
+                json.dump(cache, cache_file)
+            os.replace(temporary_path, cache_path)
+    except (OSError, json.JSONDecodeError):
+        pass
+    with AGY_SESSION_LOCK:
+        sessions = read_agy_session_index()
+        sessions.pop(session_id, None)
+        write_agy_session_index(sessions)
+    return {"id": session_id, "deleted": True}
 
 
 def initialized_app_server(mode="agent"):
@@ -533,6 +681,25 @@ def session_control_loop():
             time.sleep(2)
 
 
+def agy_session_control_loop():
+    while True:
+        try:
+            item = redis.brpop("agy:session:requests", timeout=3)
+            if not item:
+                continue
+            request = json.loads(item[1])
+            request_id = request["request_id"]
+            response_key = f"agy:session:response:{request_id}"
+            try:
+                payload = {"result": agy_session_control(request["operation"], request.get("session_id"))}
+            except Exception as exc:
+                payload = {"error": f"Antigravity session operation failed: {type(exc).__name__}"}
+            redis.setex(response_key, 120, json.dumps(payload))
+        except Exception as exc:
+            print(f"agy session control queue error: {type(exc).__name__}", flush=True)
+            time.sleep(2)
+
+
 def loop():
     while True:
         try:
@@ -568,6 +735,7 @@ if __name__ == "__main__":
     threading.Thread(target=model_catalog_loop, args=("codex",), daemon=True).start()
     threading.Thread(target=model_catalog_loop, args=("agy",), daemon=True).start()
     threading.Thread(target=session_control_loop, daemon=True).start()
+    threading.Thread(target=agy_session_control_loop, daemon=True).start()
     for _ in range(CONCURRENCY - 1):
         threading.Thread(target=loop, daemon=True).start()
     loop()

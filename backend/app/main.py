@@ -124,7 +124,8 @@ def models(provider: Literal["codex", "agy"] = "codex"):
 
 @app.post("/v1/jobs", dependencies=[Depends(auth)], status_code=202)
 def submit(req: JobRequest):
-    mode = req.gateway_options.mode if req.gateway_options else ("agent" if req.session_id else "chat")
+    mode = req.gateway_options.mode if req.gateway_options else (
+        "chat" if req.provider == "agy" else ("agent" if req.session_id else "chat"))
     return {"id": enqueue(req.prompt, normalized_model(req.model, req.provider), req.session_id,
                            req.store_session, req.system_prompt, mode, req.provider), "status": "queued"}
 
@@ -134,7 +135,8 @@ def job_status(job_id: str):
 
 @app.post("/v1/chat/completions", dependencies=[Depends(auth)])
 async def chat(req: ChatRequest):
-    mode = req.gateway_options.mode if req.gateway_options else ("agent" if req.session_id else "chat")
+    mode = req.gateway_options.mode if req.gateway_options else (
+        "chat" if req.provider == "agy" else ("agent" if req.session_id else "chat"))
     max_history_messages = req.gateway_options.max_history_messages if req.gateway_options else 10
     if req.stream:
         raise HTTPException(400, "Streaming is not supported in MVP")
@@ -172,6 +174,7 @@ async def chat(req: ChatRequest):
         if j["status"] == "completed":
             return {"id": "chatcmpl-" + job_id, "object": "chat.completion", "created": int(time.time()),
                     "model": req.model, "provider": req.provider, "session_id": j.get("session_id"),
+                    "usage": j.get("usage"),
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": j["result"]}, "finish_reason": "stop"}]}
         if j["status"] in ("failed", "cancelled"):
             raise HTTPException(502, {"job_id": job_id, "error": j["error"] or j["status"]})
@@ -215,21 +218,28 @@ def admin_sessions():
     try:
         sessions = session_control("list", mode="agent")
         sessions += session_control("list", mode="chat")
+        sessions += session_control("list", provider="agy")
+        for item in sessions:
+            item.setdefault("provider", "codex")
         return {"sessions": sessions}
     except Exception as exc:
         raise HTTPException(503, f"Could not list Codex sessions: {type(exc).__name__}") from exc
 
 @app.get("/admin/sessions/{session_id}", dependencies=[Depends(auth)])
-def admin_session_history(session_id: str, mode: Literal["chat", "agent"] = "agent"):
+def admin_session_history(session_id: str, mode: Literal["chat", "agent"] = "agent",
+                          provider: Literal["codex", "agy"] = "codex"):
     try:
-        return session_control("history", session_id, mode)
+        return session_control("history", session_id, mode, provider=provider)
     except Exception as exc:
         raise HTTPException(503, f"Could not read Codex session: {type(exc).__name__}") from exc
 
 @app.delete("/admin/sessions/{session_id}", dependencies=[Depends(auth)])
-def delete_admin_session(session_id: str, mode: Literal["chat", "agent"] = "agent"):
+def delete_admin_session(session_id: str, mode: Literal["chat", "agent"] = "agent",
+                         provider: Literal["codex", "agy"] = "codex"):
     try:
-        session_control("delete", session_id, mode)
+        session_control("delete", session_id, mode, provider=provider)
         return {"id": session_id, "deleted": True}
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(503, f"Could not delete Codex session: {type(exc).__name__}") from exc
+        raise HTTPException(503, f"Could not delete {provider} session: {type(exc).__name__}") from exc
