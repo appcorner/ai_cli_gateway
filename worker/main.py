@@ -377,6 +377,39 @@ def list_agy_sessions():
 def agy_session_control(operation, session_id=None):
     if operation == "list":
         return list_agy_sessions()
+    if operation == "usage":
+        # /usage is handled locally by the CLI, so this does not submit a model prompt.
+        with tempfile.TemporaryDirectory(prefix="agy-usage-") as workdir:
+            process = subprocess.run(
+                ["agy", "-p", "/usage", "--output-format", "json"], capture_output=True, text=True,
+                cwd=workdir, timeout=35, check=False, env=agy_environment(),
+            )
+        if process.returncode != 0 or not (process.stdout or "").strip():
+            raise RuntimeError("agy usage command failed")
+        result = json.loads(process.stdout)
+        data = (result.get("command") or {}).get("data") or {}
+        groups = []
+        for group in data.get("groups") or []:
+            buckets = []
+            for bucket in group.get("buckets") or []:
+                remaining = bucket.get("remaining_fraction")
+                try:
+                    remaining = min(1.0, max(0.0, float(remaining)))
+                except (TypeError, ValueError):
+                    remaining = None
+                buckets.append({
+                    "id": bucket.get("id"),
+                    "name": bucket.get("name") or bucket.get("window") or "Quota",
+                    "window": bucket.get("window"),
+                    "remaining_fraction": remaining,
+                    "reset_time": bucket.get("reset_time"),
+                })
+            if buckets:
+                groups.append({"name": group.get("name") or "Model group",
+                               "description": group.get("description"), "buckets": buckets})
+        if not groups:
+            raise RuntimeError("agy usage response did not include model quota groups")
+        return {"groups": groups, "fetched_at": datetime.now(timezone.utc).isoformat()}
     if operation == "history" and session_id:
         session = read_agy_session_index().get(session_id)
         return {"id": session_id, "provider": "agy", "messages": session.get("messages", []) if session else []}

@@ -12,7 +12,7 @@ Private Docker-based HTTP gateway for **one user**: n8n -> FastAPI -> Redis -> w
 - When session saving is enabled, Codex stores the full conversation (system instructions, prompts and answers) in the worker's persistent `codex_auth` volume. Antigravity stores its native conversation in `agy_auth`; the Gateway keeps up to 80 user/assistant transcript messages per saved conversation in `gateway_sessions.json` in the same volume. Redis is not used for persistent session history. Delete a session from the Web Console to remove its provider history and Gateway transcript.
 - Saved sessions have no automatic expiration; remove them from the Dashboard when they are no longer needed.
 - Results, status, and non-sensitive job metadata are kept in Redis memory for `JOB_TTL_SECONDS` (default one hour), then expire.
-- The Dashboard reads Codex account rate-limit windows through the Codex app-server. `agy` account usage is not shown by this gateway.
+- The Dashboard reads Codex rate-limit windows through the Codex app-server and Antigravity model quota groups through the CLI's `/usage` command. Antigravity quotas are shown by model group, with separate cards for each available time window.
 
 ## Prerequisites
 

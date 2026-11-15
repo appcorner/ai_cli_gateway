@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -202,16 +203,30 @@ def admin_job(job_id: str):
     return {**fetch(job_id), "events": []}
 
 @app.get("/admin/usage", dependencies=[Depends(auth)])
-def usage():
-    cached = redis_client.get("codex:usage-limits")
+def usage(provider: Literal["codex", "agy"] = "codex"):
+    cache_key = f"{provider}:usage-limits"
+    cached = redis_client.get(cache_key)
     if cached:
         return json.loads(cached)
+    lock_key = f"{cache_key}:lock"
+    lock_value = str(uuid.uuid4())
+    if not redis_client.set(lock_key, lock_value, nx=True, ex=50):
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+            time.sleep(0.25)
+        raise HTTPException(503, f"Timed out waiting for {provider} usage refresh")
     try:
-        result = session_control("usage", timeout_seconds=30)
-        redis_client.setex("codex:usage-limits", 60, json.dumps(result))
+        result = session_control("usage", timeout_seconds=45, provider=provider)
+        redis_client.setex(cache_key, 60, json.dumps(result))
         return result
     except Exception as exc:
-        raise HTTPException(503, f"Could not read Codex usage limits: {type(exc).__name__}") from exc
+        raise HTTPException(503, f"Could not read {provider} usage limits: {type(exc).__name__}") from exc
+    finally:
+        redis_client.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                          1, lock_key, lock_value)
 
 @app.get("/admin/sessions", dependencies=[Depends(auth)])
 def admin_sessions():
