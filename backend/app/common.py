@@ -17,13 +17,14 @@ def utcnow():
 
 def enqueue(prompt: str, model: str | None, session_id: str | None = None,
             store_session: bool = False, system_prompt: str | None = None,
-            mode: str = "chat"):
+            mode: str = "chat", provider: str = "codex"):
     job_id = str(uuid.uuid4())
     now = utcnow()
     job = {"id": job_id, "status": "queued", "prompt": prompt, "model": model or "",
            "session_id": session_id or "", "store_session": "1" if store_session else "0",
            "system_prompt": system_prompt or "",
            "mode": mode,
+           "provider": provider,
            "created_at": now, "finished_at": "", "result": "", "error": "", "duration_ms": ""}
     with redis_client.pipeline(transaction=True) as pipe:
         pipe.hset(f"codex:job:{job_id}", mapping=job)
@@ -38,6 +39,7 @@ def fetch(job_id: str):
     if not job:
         return None
     return {"id": job["id"], "status": job["status"], "model": job.get("model") or None,
+            "provider": job.get("provider") or "codex",
             "session_id": job.get("session_id") or None,
             "result": job.get("result") or None, "error": job.get("error") or None,
             "duration_ms": int(job["duration_ms"]) if job.get("duration_ms") else None,
@@ -48,13 +50,13 @@ def public_job(job):
     return job
 
 
-def get_model_catalog(timeout_seconds: int = 100):
-    cached = redis_client.get("codex:model-catalog")
+def get_model_catalog(provider: str = "codex", timeout_seconds: int = 100):
+    cached = redis_client.get(f"{provider}:model-catalog")
     if cached:
         return json.loads(cached)
     request_id = str(uuid.uuid4())
-    response_key = f"codex:model-catalog:response:{request_id}"
-    redis_client.lpush("codex:model-catalog:requests", request_id)
+    response_key = f"{provider}:model-catalog:response:{request_id}"
+    redis_client.lpush(f"{provider}:model-catalog:requests", request_id)
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         response = redis_client.get(response_key)
@@ -63,11 +65,11 @@ def get_model_catalog(timeout_seconds: int = 100):
             payload = json.loads(response)
             if payload.get("error"):
                 raise RuntimeError(payload["error"])
-            redis_client.setex("codex:model-catalog", 300, json.dumps(payload["models"]))
+            redis_client.setex(f"{provider}:model-catalog", 300, json.dumps(payload["models"]))
             return payload["models"]
         time.sleep(0.2)
     redis_client.delete(response_key)
-    raise TimeoutError("Timed out waiting for Codex model catalog")
+    raise TimeoutError(f"Timed out waiting for {provider} model catalog")
 
 
 def session_control(operation: str, session_id: str | None = None, mode: str = "agent",

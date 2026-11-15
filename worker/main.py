@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import queue
 import subprocess
 import tempfile
@@ -35,7 +36,7 @@ enabled = false
 
 def codex_environment(mode="agent"):
     env = {k: v for k, v in os.environ.items()
-           if k not in ("GATEWAY_API_KEY", "DATABASE_URL", "POSTGRES_PASSWORD")}
+           if k not in ("GATEWAY_API_KEY", "DATABASE_URL", "POSTGRES_PASSWORD", "GEMINI_API_KEY")}
     if mode == "chat":
         with CHAT_HOME_LOCK:
             os.makedirs(CHAT_CODEX_HOME, mode=0o700, exist_ok=True)
@@ -87,10 +88,22 @@ def execute(job_id):
     store_session = job.get("store_session") == "1"
     system_prompt = job.get("system_prompt") or None
     mode = job.get("mode") or "chat"
+    provider = job.get("provider") or "codex"
     result = None
     error = None
     status = "failed"
-    if session_id or store_session or system_prompt:
+    if provider == "agy":
+        try:
+            result, session_id = run_agy_turn(prompt, model, session_id, system_prompt,
+                                              store_session or bool(session_id))
+            status = "completed" if result else "failed"
+            if not result:
+                error = "agy returned no answer"
+        except subprocess.TimeoutExpired:
+            error = f"agy exceeded {TIMEOUT}s timeout"
+        except Exception as exc:
+            error = f"agy request failed: {type(exc).__name__}"
+    elif session_id or store_session or system_prompt:
         try:
             persistent_session = bool(session_id or store_session)
             result, session_id = run_session_turn(prompt, model, session_id, system_prompt, store_session, mode)
@@ -175,7 +188,7 @@ def read_models_from_codex():
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, text=True, bufsize=1,
                                env={k: v for k, v in os.environ.items()
-                                    if k not in ("GATEWAY_API_KEY", "DATABASE_URL", "POSTGRES_PASSWORD")})
+                                    if k not in ("GATEWAY_API_KEY", "DATABASE_URL", "POSTGRES_PASSWORD", "GEMINI_API_KEY")})
     incoming = queue.Queue()
 
     def read_stdout():
@@ -211,6 +224,62 @@ def read_models_from_codex():
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             process.kill()
+
+
+def read_models_from_agy():
+    process = subprocess.run(["agy", "models"], capture_output=True, text=True,
+                             timeout=min(TIMEOUT, 60), check=False,
+                             env={k: v for k, v in os.environ.items()
+                                  if k not in ("GATEWAY_API_KEY", "DATABASE_URL", "POSTGRES_PASSWORD")})
+    if process.returncode != 0:
+        raise RuntimeError("agy model discovery failed")
+    models = []
+    seen = set()
+    for line in process.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if not parts:
+            continue
+        model_id = parts[0]
+        if re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", model_id) and model_id.lower() not in ("model", "models") and model_id not in seen:
+            seen.add(model_id)
+            models.append({"id": model_id, "name": parts[1].strip() if len(parts) > 1 else model_id,
+                           "is_default": False})
+    if not models:
+        raise RuntimeError("agy returned an empty model catalog")
+    return models
+
+
+def run_agy_turn(prompt, model, session_id=None, system_prompt=None, persist=False):
+    prompt = f"User request:\n{prompt}"
+    if system_prompt:
+        prompt = f"System instructions:\n{system_prompt}\n\n{prompt}"
+    with tempfile.TemporaryDirectory(prefix="agy-job-") as workdir:
+        command = ["agy", "--input-format", "stream-json", "--output-format", "stream-json",
+                   "--print-timeout", f"{TIMEOUT}s", "--sandbox", "--disable-slash-commands"]
+        if model:
+            command.extend(["--model", model])
+        if session_id:
+            command.extend(["--conversation", session_id])
+        input_event = json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
+        process = subprocess.run(command, input=input_event, cwd=workdir, capture_output=True, text=True,
+                                 timeout=TIMEOUT + 30, check=False,
+                                 env={k: v for k, v in os.environ.items()
+                                      if k not in ("GATEWAY_API_KEY", "DATABASE_URL", "POSTGRES_PASSWORD", "CODEX_HOME")})
+    envelope = None
+    for line in process.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") == "result":
+            envelope = event.get("result") or {}
+    if envelope is None:
+        raise RuntimeError("agy did not return a result event")
+    if process.returncode != 0 or envelope.get("status") != "SUCCESS":
+        raise RuntimeError("agy did not complete successfully")
+    answer = (envelope.get("response") or "").strip()
+    conversation_id = envelope.get("conversation_id") if persist else None
+    return answer, conversation_id
 
 
 def initialized_app_server(mode="agent"):
@@ -416,18 +485,18 @@ def perform_session_control(operation, session_id=None, mode="agent"):
             process.kill()
 
 
-def model_catalog_loop():
+def model_catalog_loop(provider="codex"):
     while True:
         try:
-            item = redis.brpop("codex:model-catalog:requests", timeout=3)
+            item = redis.brpop(f"{provider}:model-catalog:requests", timeout=3)
             if not item:
                 continue
             request_id = item[1]
-            response_key = f"codex:model-catalog:response:{request_id}"
+            response_key = f"{provider}:model-catalog:response:{request_id}"
             try:
-                payload = {"models": read_models_from_codex()}
+                payload = {"models": read_models_from_agy() if provider == "agy" else read_models_from_codex()}
             except Exception as exc:
-                payload = {"error": f"Codex model discovery failed: {type(exc).__name__}"}
+                payload = {"error": f"{provider} model discovery failed: {type(exc).__name__}"}
             redis.setex(response_key, 120, json.dumps(payload))
         except Exception as exc:
             print(f"model catalog queue error: {type(exc).__name__}", flush=True)
@@ -476,8 +545,28 @@ def loop():
 
 
 if __name__ == "__main__":
-    print(f"Codex worker started, concurrency={CONCURRENCY}", flush=True)
-    threading.Thread(target=model_catalog_loop, daemon=True).start()
+    print(f"AI CLI Gateway worker started, concurrency={CONCURRENCY}", flush=True)
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    settings_dir = os.path.join(os.environ.get("HOME", "/home/node"), ".gemini", "antigravity-cli")
+    os.makedirs(settings_dir, mode=0o700, exist_ok=True)
+    settings_path = os.path.join(settings_dir, "settings.json")
+    settings = {}
+    if os.path.isfile(settings_path):
+        try:
+            with open(settings_path, encoding="utf-8") as settings_file:
+                settings = json.load(settings_file)
+        except (OSError, json.JSONDecodeError):
+            pass
+    settings["toolPermission"] = "request-review"
+    if gemini_api_key:
+        settings["modelProvider"] = "gemini"
+    temporary_settings_path = settings_path + ".tmp"
+    with open(temporary_settings_path, "w", encoding="utf-8") as settings_file:
+        json.dump(settings, settings_file)
+    os.replace(temporary_settings_path, settings_path)
+    os.chmod(settings_path, 0o600)
+    threading.Thread(target=model_catalog_loop, args=("codex",), daemon=True).start()
+    threading.Thread(target=model_catalog_loop, args=("agy",), daemon=True).start()
     threading.Thread(target=session_control_loop, daemon=True).start()
     for _ in range(CONCURRENCY - 1):
         threading.Thread(target=loop, daemon=True).start()

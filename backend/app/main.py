@@ -12,16 +12,17 @@ from .common import JOB_TTL_SECONDS, enqueue, fetch as _fetch, get_model_catalog
 
 API_KEY = os.getenv("GATEWAY_API_KEY", "")
 MODEL_DEFAULT = os.getenv("DEFAULT_MODEL", "")
+AGY_MODEL_DEFAULT = os.getenv("AGY_DEFAULT_MODEL", "")
 WAIT_SECONDS = max(1, min(int(os.getenv("CHAT_WAIT_SECONDS", "90")), 300))
 LOG_REQUEST_BODIES = os.getenv("LOG_REQUEST_BODIES", "false").lower() in ("1", "true", "yes", "on")
-logger = logging.getLogger("codex_gateway.request_debug")
+logger = logging.getLogger("ai_cli_gateway.request_debug")
 
 @asynccontextmanager
 async def lifespan(app):
     redis_client.ping()
     yield
 
-app = FastAPI(title="Personal Codex Gateway", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Personal AI CLI Gateway", version="0.1.0", lifespan=lifespan)
 
 @app.middleware("http")
 async def log_request_body(request, call_next):
@@ -65,6 +66,7 @@ class GatewayOptions(BaseModel):
     max_history_messages: int = Field(default=10, ge=1, le=50)
 
 class ChatRequest(BaseModel):
+    provider: Literal["codex", "agy"] = "codex"
     model: str = "codex-default"
     messages: list[Message] = Field(min_length=1, max_length=50)
     stream: bool = False
@@ -74,6 +76,7 @@ class ChatRequest(BaseModel):
     gateway_options: GatewayOptions | None = None
 
 class JobRequest(BaseModel):
+    provider: Literal["codex", "agy"] = "codex"
     prompt: str = Field(min_length=1, max_length=60000)
     model: str = "codex-default"
     session_id: str | None = None
@@ -81,15 +84,15 @@ class JobRequest(BaseModel):
     system_prompt: str | None = Field(default=None, max_length=20000)
     gateway_options: GatewayOptions | None = None
 
-def normalized_model(model: str):
-    if model in ("codex-default", "default"):
-        return MODEL_DEFAULT or None
+def normalized_model(model: str, provider: str = "codex"):
+    if model in (f"{provider}-default", "default", "codex-default"):
+        return (AGY_MODEL_DEFAULT if provider == "agy" else MODEL_DEFAULT) or None
     try:
-        if any(item["id"] == model for item in get_model_catalog()):
+        if any(item["id"] == model for item in get_model_catalog(provider)):
             return model
     except Exception as exc:
-        raise HTTPException(503, f"Codex model catalog unavailable: {type(exc).__name__}") from exc
-    raise HTTPException(400, "Only codex-default or a model returned by /v1/models is supported")
+        raise HTTPException(503, f"{provider} model catalog unavailable: {type(exc).__name__}") from exc
+    raise HTTPException(400, f"Model must be {provider}-default or a model returned by /v1/models?provider={provider}")
 
 def fetch(job_id: str):
     job = _fetch(job_id)
@@ -106,14 +109,15 @@ def health():
         raise HTTPException(503, "Dependencies unavailable")
 
 @app.get("/v1/models", dependencies=[Depends(auth)])
-def models():
+def models(provider: Literal["codex", "agy"] = "codex"):
     try:
-        catalog = get_model_catalog()
+        catalog = get_model_catalog(provider)
     except Exception as exc:
-        raise HTTPException(503, f"Could not load Codex model catalog: {type(exc).__name__}") from exc
-    data = [{"id": "codex-default", "object": "model", "owned_by": "local-codex",
-             "description": "Gateway alias for the configured Codex default model"}]
-    data.extend({"id": item["id"], "object": "model", "owned_by": "openai",
+        raise HTTPException(503, f"Could not load {provider} model catalog: {type(exc).__name__}") from exc
+    default_id = "codex-default" if provider == "codex" else "agy-default"
+    data = [{"id": default_id, "object": "model", "owned_by": f"local-{provider}",
+             "description": f"Gateway alias for the configured {provider} default model"}]
+    data.extend({"id": item["id"], "object": "model", "owned_by": provider,
                  "name": item.get("name", item["id"]), "is_default": item.get("is_default", False)}
                 for item in catalog)
     return {"object": "list", "data": data}
@@ -121,8 +125,8 @@ def models():
 @app.post("/v1/jobs", dependencies=[Depends(auth)], status_code=202)
 def submit(req: JobRequest):
     mode = req.gateway_options.mode if req.gateway_options else ("agent" if req.session_id else "chat")
-    return {"id": enqueue(req.prompt, normalized_model(req.model), req.session_id,
-                           req.store_session, req.system_prompt, mode), "status": "queued"}
+    return {"id": enqueue(req.prompt, normalized_model(req.model, req.provider), req.session_id,
+                           req.store_session, req.system_prompt, mode, req.provider), "status": "queued"}
 
 @app.get("/v1/jobs/{job_id}", dependencies=[Depends(auth)])
 def job_status(job_id: str):
@@ -160,14 +164,14 @@ async def chat(req: ChatRequest):
             prompt += "\nReply to the most recent user turn."
     if len(prompt) > 60000:
         raise HTTPException(413, "Conversation too long")
-    job_id = await asyncio.to_thread(enqueue, prompt, normalized_model(req.model), req.session_id,
-                                     req.store_session, system_prompt, mode)
+    job_id = await asyncio.to_thread(enqueue, prompt, normalized_model(req.model, req.provider), req.session_id,
+                                     req.store_session, system_prompt, mode, req.provider)
     deadline = time.monotonic() + WAIT_SECONDS
     while time.monotonic() < deadline:
         j = await asyncio.to_thread(fetch, job_id)
         if j["status"] == "completed":
             return {"id": "chatcmpl-" + job_id, "object": "chat.completion", "created": int(time.time()),
-                    "model": req.model, "session_id": j.get("session_id"),
+                    "model": req.model, "provider": req.provider, "session_id": j.get("session_id"),
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": j["result"]}, "finish_reason": "stop"}]}
         if j["status"] in ("failed", "cancelled"):
             raise HTTPException(502, {"job_id": job_id, "error": j["error"] or j["status"]})

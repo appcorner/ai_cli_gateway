@@ -1,3 +1,4 @@
+# Keep the Compose project and existing resource names stable for upgrades.
 name: codex-gateway
 services:
   redis:
@@ -14,6 +15,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       GATEWAY_API_KEY: ${GATEWAY_API_KEY:?set GATEWAY_API_KEY}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-}
+      AGY_DEFAULT_MODEL: ${AGY_DEFAULT_MODEL:-}
       JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-120}
       CHAT_WAIT_SECONDS: ${CHAT_WAIT_SECONDS:-90}
       JOB_TTL_SECONDS: ${JOB_TTL_SECONDS:-3600}
@@ -28,11 +30,17 @@ services:
       REDIS_URL: redis://redis:6379/0
       HOME: /home/node
       CODEX_HOME: /home/node/.codex
+      AGY_ADC_AUTH: ${AGY_ADC_AUTH:-false}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-120}
       MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-1}
       JOB_TTL_SECONDS: ${JOB_TTL_SECONDS:-3600}
     volumes:
       - codex_auth:/home/node/.codex
+      - agy_auth:/home/node/.gemini
+      - agy_gcloud_auth:/home/node/.config/gcloud
     depends_on:
       redis: {condition: service_healthy}
     networks: [gateway-internal]
@@ -54,3 +62,8 @@ networks:
     name: codex-gateway-public
 volumes:
   codex_auth:
+    name: codex-gateway_codex_auth
+  agy_auth:
+    name: ai-cli-gateway_agy_auth
+  agy_gcloud_auth:
+    name: ai-cli-gateway_agy_gcloud_auth
