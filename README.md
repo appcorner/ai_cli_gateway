@@ -16,7 +16,7 @@ Private Docker-based HTTP gateway for **one user**: n8n -> FastAPI -> Redis -> w
 
 ## Prerequisites
 
-Docker Engine/Compose v2, internet access from worker to OpenAI and Google, and an existing n8n Docker installation. For Codex use an account entitled to Codex CLI sign-in. For `agy`, authenticate the CLI in its persistent worker home or configure Gemini API key / Google Cloud ADC authentication as described below.
+Docker Engine/Compose v2, internet access from worker to OpenAI and Google, and an existing n8n Docker installation. For Codex use an account entitled to Codex CLI sign-in. For `agy`, sign in with a Google account; this gateway does not accept Gemini API keys or Google Cloud ADC as Antigravity authentication.
 
 ## Quick start
 
@@ -29,8 +29,8 @@ docker compose up -d
 docker compose exec worker codex login --device-auth
 # Verify login:
 docker compose exec worker codex login status
-# Optional: agy sign-in if using Antigravity account authentication
-docker compose exec -it worker agy
+# Sign in to Antigravity with your Google account (see the steps below)
+docker compose exec -it worker agy acp --login
 # Check API:
 curl http://127.0.0.1:8088/health
 # Call from host (use the actual key from .env):
@@ -46,11 +46,42 @@ Open **http://127.0.0.1:8088/**, unlock with the local Gateway API key, then sel
 
 ### Antigravity (`agy`) authentication
 
-The worker image installs the official Antigravity CLI. Its data is stored in the separate `agy_auth` volume at `/home/node/.gemini`.
+The worker image installs the official Antigravity CLI. Google OAuth credentials, CLI settings, and Antigravity conversations persist in the Docker volume `ai-cli-gateway_agy_auth`, mounted at `/home/node/.gemini`. The Gateway accepts Google account sign-in only; Gemini API-key and ADC credentials are not passed to agy.
 
-- Account sign-in: run `docker compose exec -it worker agy` and follow the CLI's sign-in instructions. Some personal-account OAuth flows require an interactive browser/keyring available on the host; if the container cannot complete that flow, use Gemini API key or ADC auth.
-- Gemini API key: set `GEMINI_API_KEY` in `.env`. The worker configures `modelProvider: gemini` in the Antigravity settings. Keep `.env` private.
-- Google Cloud ADC: provision ADC credentials at `/home/node/.config/gcloud/application_default_credentials.json` in the worker (the `agy_gcloud_auth` named volume persists this directory), then set `AGY_ADC_AUTH=true`, `GOOGLE_CLOUD_PROJECT`, and `GOOGLE_CLOUD_LOCATION` in `.env`. The gateway does not mount host credentials automatically.
+#### First-time setup (PowerShell)
+
+1. Rebuild and start the worker so the OAuth-only configuration is active:
+
+   ```powershell
+   docker compose up -d --build worker
+   ```
+
+2. Confirm the installed CLI supports ACP login:
+
+   ```powershell
+   docker compose exec worker agy acp --help
+   ```
+
+   ACP login is available in Antigravity CLI 1.5.0 and later. If `acp` or `--login` is not recognized, rebuild the worker image without cache to install the current CLI:
+
+   ```powershell
+   docker compose build --no-cache worker
+   docker compose up -d worker
+   ```
+
+3. Start Google OAuth login in terminal mode:
+
+   ```powershell
+   docker compose exec -it worker agy acp --login
+   ```
+
+4. Follow the terminal instructions: open the displayed sign-in URL on the host, sign in with the intended Google account, then paste the returned code into the worker terminal. The login command exits when authentication completes.
+
+5. Verify the saved credentials by opening **http://127.0.0.1:8088/**, selecting **Antigravity CLI (agy)** in Chat Tester, and sending a short prompt. The credentials remain in the `agy_auth` volume for later worker restarts.
+
+The sign-in state survives `docker compose down` and worker rebuilds because the named `agy_auth` volume is retained. Do not remove that volume when resetting containers. Google documents `agy acp --login` as terminal-based Google sign-in for environments without a browser; the command prompts for the browser code and exits after login. See the [ACP guide](https://antigravity.google/docs/ide/extensions/acp/) and the [Antigravity CLI 1.5.0 release notes](https://antigravity.google/docs/changelog?tab=extensions) for details.
+
+For an older `.env`, remove any `GEMINI_API_KEY`, `AGY_ADC_AUTH`, `GOOGLE_CLOUD_PROJECT`, or `GOOGLE_CLOUD_LOCATION` entries. Current Compose no longer forwards these values, and worker startup removes a stale `modelProvider: gemini` setting from the agy CLI profile.
 
 The headless integration uses Antigravity's documented JSON stream input/output mode so prompts go over stdin rather than process arguments; model discovery runs `agy models`. The worker pins Antigravity tool permission to `request-review`; headless requests cannot accept interactive approvals, so approval-gated tool actions may be denied. Docker may also block the Linux user namespaces required by Antigravity's OS sandbox. Treat this as a chat gateway, not an unattended file-changing agent. Saved `agy` conversation IDs are provided by Antigravity's headless CLI and persist under its home volume.
 
@@ -132,10 +163,6 @@ curl -sS http://127.0.0.1:8088/v1/jobs \
 | GATEWAY_API_KEY | Required API/UI bearer secret | none |
 | DEFAULT_MODEL | Optional exact Codex-supported model name; blank lets CLI select default | blank |
 | AGY_DEFAULT_MODEL | Optional exact `agy` model slug; blank lets CLI select default | blank |
-| GEMINI_API_KEY | Optional key for Antigravity's Gemini API-key auth mode | blank |
-| AGY_ADC_AUTH | Enable Antigravity Application Default Credentials auth | false |
-| GOOGLE_CLOUD_PROJECT | Google Cloud project for ADC auth | blank |
-| GOOGLE_CLOUD_LOCATION | Google Cloud location for ADC auth | blank |
 | MAX_CONCURRENT_JOBS | Worker threads, capped at 4 | 1 |
 | JOB_TIMEOUT_SECONDS | Per CLI invocation, capped at 900 | 120 |
 | CHAT_WAIT_SECONDS | HTTP chat polling timeout, capped at 300 | 90 |
@@ -143,7 +170,7 @@ curl -sS http://127.0.0.1:8088/v1/jobs \
 
 ### Data & security
 
-- Docker named volumes: `codex_auth` contains Codex sign-in and session history; `agy_auth` contains Antigravity CLI settings and account data; `agy_gcloud_auth` contains ADC credentials. Protect all of them. Redis has no persistent volume and persistence is disabled.
+- Docker named volumes: `codex_auth` contains Codex sign-in and session history; `agy_auth` contains Antigravity Google OAuth account data, settings and conversation history. Protect both. Redis has no persistent volume and persistence is disabled. Existing `agy_gcloud_auth` volumes from older deployments are no longer mounted or used.
 - Agent session history files live under `/home/node/.codex/sessions`; Chat session files live under `/home/node/.codex/chat-mode/sessions` in the same worker volume. Chat mode shares only the `auth.json` sign-in file with Agent mode. Delete sessions through the Web Console so Codex can remove the history files and metadata together.
 - Redis temporarily contains queued prompt and system instruction text in memory until a worker claims the job. Job results and status are memory-only and expire automatically. Prompts are not included in API job history. The worker discards Codex event output and does not save stderr text, which may contain sensitive content. Opt-in saved sessions do persist full conversation history and instructions on disk.
 - Job cancellation, startup crash recovery, multi-user isolation, rate limiting, reverse-proxy TLS, CSRF session architecture and encrypted-at-rest storage are **not implemented**.
@@ -176,5 +203,5 @@ n8n Docker --HTTP POST--> web nginx :8088 (host) / api:8000 (docker network)
                               /           \\
              Codex CLI (exec/app-server)   Antigravity CLI (headless)
                        |                            |
-             ChatGPT sign-in              Google/ADC/API-key auth
+             ChatGPT sign-in              Google account OAuth
 ```

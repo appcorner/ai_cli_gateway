@@ -22,6 +22,11 @@ CHAT_CODEX_HOME = os.path.join(CODEX_HOME, "chat-mode")
 CHAT_HOME_LOCK = threading.Lock()
 AGY_SESSION_LOCK = threading.Lock()
 AGY_SESSION_MESSAGE_LIMIT = 80
+AGY_NON_OAUTH_ENV = {
+    "GEMINI_API_KEY", "GOOGLE_API_KEY", "AGY_ADC_AUTH",
+    "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION", "GOOGLE_CLOUD_QUOTA_PROJECT",
+}
 CHAT_CONFIG = '''model_reasoning_effort = "low"
 model_verbosity = "low"
 model_reasoning_summary = "none"
@@ -58,6 +63,13 @@ def codex_environment(mode="agent"):
         env["CODEX_HOME"] = CHAT_CODEX_HOME
         env["HOME"] = CHAT_CODEX_HOME
     return env
+
+
+def agy_environment():
+    return {key: value for key, value in os.environ.items()
+            if key not in AGY_NON_OAUTH_ENV | {
+                "GATEWAY_API_KEY", "DATABASE_URL", "POSTGRES_PASSWORD", "CODEX_HOME"
+            }}
 
 
 def chat_config_args():
@@ -237,8 +249,7 @@ def read_models_from_codex():
 def read_models_from_agy():
     process = subprocess.run(["agy", "models"], capture_output=True, text=True,
                              timeout=min(TIMEOUT, 60), check=False,
-                             env={k: v for k, v in os.environ.items()
-                                  if k not in ("GATEWAY_API_KEY", "DATABASE_URL", "POSTGRES_PASSWORD")})
+                             env=agy_environment())
     if process.returncode != 0:
         raise RuntimeError("agy model discovery failed")
     models = []
@@ -273,8 +284,7 @@ def run_agy_turn(prompt, model, session_id=None, system_prompt=None, persist=Fal
         input_event = json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
         process = subprocess.run(command, input=input_event, cwd=workdir, capture_output=True, text=True,
                                  timeout=TIMEOUT + 30, check=False,
-                                 env={k: v for k, v in os.environ.items()
-                                      if k not in ("GATEWAY_API_KEY", "DATABASE_URL", "POSTGRES_PASSWORD", "CODEX_HOME")})
+                                 env=agy_environment())
     envelope = None
     for line in process.stdout.splitlines():
         try:
@@ -713,7 +723,6 @@ def loop():
 
 if __name__ == "__main__":
     print(f"AI CLI Gateway worker started, concurrency={CONCURRENCY}", flush=True)
-    gemini_api_key = os.environ.get("GEMINI_API_KEY")
     settings_dir = os.path.join(os.environ.get("HOME", "/home/node"), ".gemini", "antigravity-cli")
     os.makedirs(settings_dir, mode=0o700, exist_ok=True)
     settings_path = os.path.join(settings_dir, "settings.json")
@@ -725,8 +734,9 @@ if __name__ == "__main__":
         except (OSError, json.JSONDecodeError):
             pass
     settings["toolPermission"] = "request-review"
-    if gemini_api_key:
-        settings["modelProvider"] = "gemini"
+    # The Gateway only supports Antigravity's Google account OAuth sign-in.
+    # Remove a stale Gemini API-key provider setting from older deployments.
+    settings.pop("modelProvider", None)
     temporary_settings_path = settings_path + ".tmp"
     with open(temporary_settings_path, "w", encoding="utf-8") as settings_file:
         json.dump(settings, settings_file)
