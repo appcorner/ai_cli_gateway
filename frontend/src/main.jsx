@@ -139,6 +139,7 @@ function App() {
   const [usageByProvider, setUsageByProvider] = useState({});
   const [usageLoading, setUsageLoading] = useState({});
   const [overviewLoading, setOverviewLoading] = useState(false);
+  const [refreshingAll, setRefreshingAll] = useState(false);
 
   const [error, setError] = useState('');
   const [systemPrompt, setSystemPrompt] = useState('');
@@ -175,6 +176,8 @@ function App() {
   const [systemPromptName, setSystemPromptName] = useState('');
 
   const chatTranscriptRef = useRef(null);
+  const providersRef = useRef(providers);
+  providersRef.current = providers;
 
   const providerMap = Object.fromEntries(providers.map((p) => [p.id, p]));
   const getProviderLabel = (id) => providerMap[id]?.display_name || id;
@@ -259,11 +262,12 @@ function App() {
   }, [token, request]);
 
   const refreshUsage = useCallback(
-    async (target = 'all', providerList = providers) => {
+    async (target = 'all', providerList) => {
       if (!token) return;
+      const activeProviders = providerList || providersRef.current;
       const targets =
         target === 'all'
-          ? providerList
+          ? activeProviders
               .filter((p) => p.capabilities?.supports_usage_quota !== false)
               .map((p) => p.id)
           : [target];
@@ -287,7 +291,7 @@ function App() {
         })
       );
     },
-    [token, request, providers]
+    [token, request]
   );
 
   const refreshModels = useCallback(
@@ -741,18 +745,26 @@ function App() {
                   <button
                     type="button"
                     className="secondary"
-                    disabled={overviewLoading}
-                    onClick={() => {
-                      refreshOverview();
-                      refreshUsage('all');
-                      refreshSessions();
+                    disabled={refreshingAll}
+                    onClick={async () => {
+                      setRefreshingAll(true);
+                      try {
+                        const items = await refreshProviders();
+                        await Promise.all([
+                          refreshOverview(),
+                          refreshUsage('all', items),
+                          refreshSessions(),
+                        ]);
+                      } finally {
+                        setRefreshingAll(false);
+                      }
                     }}
                   >
                     <RefreshCw
                       size={15}
-                      className={overviewLoading ? 'spin' : ''}
+                      className={refreshingAll ? 'spin' : ''}
                     />
-                    Refresh All
+                    {refreshingAll ? 'Refreshing…' : 'Refresh All'}
                   </button>
                 </>
               )}
