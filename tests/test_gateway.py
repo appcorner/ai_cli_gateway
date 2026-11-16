@@ -49,7 +49,9 @@ class ProviderApiTests(unittest.TestCase):
 
     def test_provider_is_inferred_from_qualified_model_id(self):
         self.assertEqual(api.resolve_provider("agy:gemini-4-argon-high"), "agy")
-        self.assertEqual(api.normalized_model("agy:gemini-4-argon-high"), "gemini-4-argon-high")
+        with patch.object(api, "get_model_catalog", return_value=[{"id": "gemini-4-argon-high"}]) as catalog:
+            self.assertEqual(api.normalized_model("agy:gemini-4-argon-high"), "gemini-4-argon-high")
+        catalog.assert_called_once_with("agy")
         self.assertEqual(api.resolve_provider("codex:o4-mini"), "codex")
 
     def test_model_prefix_must_match_explicit_provider(self):
