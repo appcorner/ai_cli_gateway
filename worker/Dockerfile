@@ -7,6 +7,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 COPY main.py .
+COPY providers ./providers
 RUN mkdir -p /work /home/node/.codex /home/node/.gemini /home/node/.config/gcloud && chown -R node:node /work /home/node/.codex /home/node/.gemini /home/node/.config /home/node/.local /app
 USER node
 ENV PATH="/opt/venv/bin:${PATH}"

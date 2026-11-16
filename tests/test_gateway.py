@@ -25,6 +25,9 @@ worker_spec = importlib.util.spec_from_file_location("gateway_worker", ROOT / "w
 worker = importlib.util.module_from_spec(worker_spec)
 worker_spec.loader.exec_module(worker)
 
+from providers import agy as agy_provider  # noqa: E402
+from providers import build_registry, parse_enabled_providers  # noqa: E402
+
 
 class MockTemporaryDirectory:
     def __init__(self, prefix):
@@ -107,10 +110,10 @@ class AgyWorkerTests(unittest.TestCase):
             with sqlite3.connect(summary_db) as connection:
                 connection.execute("CREATE TABLE conversation_summaries (conversation_id TEXT)")
                 connection.execute("INSERT INTO conversation_summaries VALUES (?)", (session_id,))
-            with patch.object(worker, "agy_cli_home", return_value=str(cli_home)), \
-                    patch.object(worker, "read_agy_session_index", return_value={session_id: {"id": session_id}}), \
-                    patch.object(worker, "write_agy_session_index") as write_index:
-                result = worker.delete_agy_session(session_id)
+            with patch.object(agy_provider, "agy_cli_home", return_value=str(cli_home)), \
+                    patch.object(agy_provider._SESSION_STORE, "read_index", return_value={session_id: {"id": session_id}}), \
+                    patch.object(agy_provider._SESSION_STORE, "write_index") as write_index:
+                result = agy_provider.delete_agy_session(session_id)
             self.assertTrue(result["deleted"])
             self.assertFalse(session_db.exists())
             with sqlite3.connect(summary_db) as connection:
@@ -125,19 +128,19 @@ class AgyWorkerTests(unittest.TestCase):
         try:
             cli_home = home / ".gemini" / "antigravity-cli"
             cli_home.mkdir(parents=True)
-            with patch.object(worker, "agy_cli_home", return_value=str(cli_home)), \
-                    patch.object(worker, "read_agy_session_index", return_value={session_id: {"id": session_id}}), \
-                    patch.object(worker, "write_agy_session_index") as write_index:
-                result = worker.delete_agy_session(session_id)
+            with patch.object(agy_provider, "agy_cli_home", return_value=str(cli_home)), \
+                    patch.object(agy_provider._SESSION_STORE, "read_index", return_value={session_id: {"id": session_id}}), \
+                    patch.object(agy_provider._SESSION_STORE, "write_index") as write_index:
+                result = agy_provider.delete_agy_session(session_id)
             self.assertTrue(result["deleted"])
             write_index.assert_called_once_with({})
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
     def test_agy_session_history_is_read_from_registry(self):
-        with patch.object(worker, "read_agy_session_index", return_value={
+        with patch.object(agy_provider._SESSION_STORE, "read_index", return_value={
                 "conv-123": {"messages": [{"role": "user", "content": "hello"}]}}):
-            history = worker.agy_session_control("history", "conv-123")
+            history = agy_provider.agy_session_control("history", "conv-123")
         self.assertEqual(history["provider"], "agy")
         self.assertEqual(history["messages"][0]["content"], "hello")
 
@@ -165,10 +168,10 @@ class AgyWorkerTests(unittest.TestCase):
             "stdout": '{"event":"init","conversation_id":"conv-123"}\n{"event":"result","result":{"status":"SUCCESS","response":"  answer\\n","conversation_id":"conv-123","usage":{"input_tokens":12,"output_tokens":4,"thinking_tokens":2,"cache_read_tokens":3,"total_tokens":18}}}',
             "returncode": 0,
         })()
-        with patch.object(worker.subprocess, "run", return_value=completed) as run, \
-                patch.object(worker.tempfile, "TemporaryDirectory", workspace_temporary_directory):
-            result = worker.run_agy_turn("question", "gemini-4-argon-high", "conv-123",
-                                         "Be concise", persist=True)
+        with patch.object(agy_provider.subprocess, "run", return_value=completed) as run, \
+                patch.object(agy_provider.tempfile, "TemporaryDirectory", workspace_temporary_directory):
+            result = agy_provider.run_agy_turn("question", "gemini-4-argon-high", "conv-123",
+                                               "Be concise", persist=True)
         self.assertEqual(result, ("answer", "conv-123", {
             "input_tokens": 12, "output_tokens": 4, "thinking_tokens": 2,
             "cache_read_tokens": 3, "total_tokens": 18,
@@ -185,19 +188,40 @@ class AgyWorkerTests(unittest.TestCase):
 
     def test_headless_turn_rejects_cli_failure(self):
         completed = type("Completed", (), {"stdout": '{"event":"result","result":{"status":"ERROR","response":""}}', "returncode": 1})()
-        with patch.object(worker.subprocess, "run", return_value=completed), \
-                patch.object(worker.tempfile, "TemporaryDirectory", workspace_temporary_directory):
+        with patch.object(agy_provider.subprocess, "run", return_value=completed), \
+                patch.object(agy_provider.tempfile, "TemporaryDirectory", workspace_temporary_directory):
             with self.assertRaises(RuntimeError):
-                worker.run_agy_turn("question", None)
+                agy_provider.run_agy_turn("question", None)
 
     def test_model_catalog_parses_cli_slugs(self):
         completed = type("Completed", (), {
             "stdout": "gemini-4-argon-high    Gemini 4 Argon (High)\ngemini-3.8-flash-medium Gemini 3.8 Flash (Medium)\n",
             "returncode": 0,
         })()
-        with patch.object(worker.subprocess, "run", return_value=completed):
-            models = worker.read_models_from_agy()
+        with patch.object(agy_provider.subprocess, "run", return_value=completed):
+            models = agy_provider.read_models_from_agy()
         self.assertEqual([item["id"] for item in models], ["gemini-4-argon-high", "gemini-3.8-flash-medium"])
+
+
+class ProviderRegistryTests(unittest.TestCase):
+    def test_parse_enabled_providers_supports_mode_a_and_mode_b(self):
+        self.assertEqual(parse_enabled_providers(""), ["codex", "agy"])
+        self.assertEqual(parse_enabled_providers("codex, agy"), ["codex", "agy"])
+        self.assertEqual(parse_enabled_providers("agy"), ["agy"])
+        with self.assertRaises(ValueError):
+            parse_enabled_providers("codex,unknown_cli")
+
+    def test_build_registry_returns_only_enabled_providers(self):
+        registry = build_registry(redis_client=object(), timeout_seconds=90, enabled_names=["agy"])
+        self.assertEqual(list(registry.keys()), ["agy"])
+        self.assertTrue(registry["agy"].capabilities.supports_sessions)
+
+    def test_worker_queue_keys_support_shared_and_dedicated_modes(self):
+        with patch.object(worker, "WORKER_QUEUE_MODE", "shared"):
+            self.assertEqual(worker._job_queue_keys(), ["codex:jobs"])
+        with patch.object(worker, "WORKER_QUEUE_MODE", "dedicated"), \
+                patch.object(worker, "REGISTRY", {"agy": object()}):
+            self.assertEqual(worker._job_queue_keys(), ["gateway:jobs:agy"])
 
 
 if __name__ == "__main__":
