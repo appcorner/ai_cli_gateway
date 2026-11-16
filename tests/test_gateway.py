@@ -243,12 +243,29 @@ class ProviderRegistryTests(unittest.TestCase):
 class OpenCodeWorkerTests(unittest.TestCase):
     def test_model_catalog_parses_provider_slash_model(self):
         completed = type("Completed", (), {
-            "stdout": "anthropic/claude-sonnet-4-5\nopenai/gpt-4o\ninvalid-line\n",
+            "stdout": "opencode-go/glm-5.3\nopencode/deepseek-v4.1-flash\nopenai/gpt-4o\ninvalid-line\n",
             "returncode": 0,
         })()
         with patch.object(opencode_provider.subprocess, "run", return_value=completed):
-            models = opencode_provider.read_models_from_opencode()
-        self.assertEqual([item["id"] for item in models], ["anthropic/claude-sonnet-4-5", "openai/gpt-4o"])
+            all_models = opencode_provider.read_models_from_opencode(model_filter="all")
+            go_models = opencode_provider.read_models_from_opencode(model_filter="go")
+            zen_models = opencode_provider.read_models_from_opencode(model_filter="zen")
+            multi_models = opencode_provider.read_models_from_opencode(model_filter="go,openai")
+        self.assertEqual(
+            [item["id"] for item in all_models],
+            ["opencode-go/glm-5.3", "opencode/deepseek-v4.1-flash", "openai/gpt-4o"],
+        )
+        self.assertEqual([item["id"] for item in go_models], ["opencode-go/glm-5.3"])
+        self.assertEqual([item["id"] for item in zen_models], ["opencode/deepseek-v4.1-flash"])
+        self.assertEqual([item["id"] for item in multi_models], ["opencode-go/glm-5.3", "openai/gpt-4o"])
+        self.assertEqual(
+            opencode_provider.resolve_opencode_model("deepseek-v4.1-flash", "go"),
+            "opencode-go/deepseek-v4.1-flash",
+        )
+        self.assertEqual(
+            opencode_provider.resolve_opencode_model("opencode/deepseek-v4.1-flash", "go"),
+            "opencode/deepseek-v4.1-flash",
+        )
 
     def test_run_opencode_turn_parses_jsonl_and_passes_prompt(self):
         stdout = "\n".join([

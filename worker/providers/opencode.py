@@ -38,7 +38,36 @@ _SESSION_STORE = GatewaySessionStore(
 )
 
 
-def read_models_from_opencode(timeout: int = 60) -> list[dict[str, Any]]:
+_FILTER_ALIASES = {
+    "go": "opencode-go",
+    "zen": "opencode",
+}
+
+
+def parse_model_filter(raw: str | None = None) -> set[str] | None:
+    value = raw if raw is not None else os.environ.get("OPENCODE_MODEL_FILTER", "")
+    cleaned = value.strip().lower()
+    if not cleaned or cleaned == "all":
+        return None
+    prefixes = set()
+    for part in cleaned.split(","):
+        token = part.strip().rstrip("/")
+        if not token:
+            continue
+        prefixes.add(_FILTER_ALIASES.get(token, token))
+    return prefixes or None
+
+
+def resolve_opencode_model(model: str | None, model_filter: str | None = None) -> str | None:
+    if not model or "/" in model:
+        return model
+    prefixes = parse_model_filter(model_filter)
+    if prefixes and len(prefixes) == 1:
+        return f"{next(iter(prefixes))}/{model}"
+    return model
+
+
+def read_models_from_opencode(timeout: int = 60, model_filter: str | None = None) -> list[dict[str, Any]]:
     process = subprocess.run(
         ["opencode", "models"],
         stdin=subprocess.DEVNULL,
@@ -50,6 +79,7 @@ def read_models_from_opencode(timeout: int = 60) -> list[dict[str, Any]]:
     )
     if process.returncode != 0:
         raise RuntimeError("opencode model discovery failed")
+    allowed_prefixes = parse_model_filter(model_filter)
     models = []
     seen = set()
     for line in process.stdout.splitlines():
@@ -59,6 +89,9 @@ def read_models_from_opencode(timeout: int = 60) -> list[dict[str, Any]]:
             and re.fullmatch(r"[a-zA-Z0-9._-]+/[a-zA-Z0-9._:-]+", token)
             and token not in seen
         ):
+            provider_prefix = token.split("/", 1)[0].lower()
+            if allowed_prefixes is not None and provider_prefix not in allowed_prefixes:
+                continue
             seen.add(token)
             models.append({"id": token, "name": token, "is_default": False})
     if not models:
@@ -122,9 +155,10 @@ def run_opencode_turn(
         formatted_prompt = f"System instructions:\n{system_prompt}\n\nUser request:\n{prompt}"
 
     with tempfile.TemporaryDirectory(prefix="opencode-job-") as workdir:
+        resolved_model = resolve_opencode_model(model)
         command = ["opencode", "run", "--format", "json"]
-        if model:
-            command.extend(["--model", model])
+        if resolved_model:
+            command.extend(["--model", resolved_model])
         if session_id:
             command.extend(["--session", session_id])
         command.extend(["--", formatted_prompt])

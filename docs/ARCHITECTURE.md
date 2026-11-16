@@ -135,3 +135,35 @@ flowchart TB
 4. เพิ่ม named volume สำหรับเก็บ credentials/session ของค่ายนั้นใน `docker-compose.yml` และตั้งค่า `ENABLED_PROVIDERS` ตามต้องการ
 5. (ถ้าต้องการ) กำหนด `<NAME>_DEFAULT_MODEL` ใน `.env` เพื่อใช้กับ alias `<name>-default`
 6. เพิ่ม unit test ใน `tests/test_gateway.py` และรัน `python -m unittest tests/test_gateway.py -v`
+
+---
+
+## 7. การตั้งค่า Environment Variables (Configuration Reference)
+
+| ตัวแปร | ใช้กับ | ค่าเริ่มต้น | คำอธิบาย |
+|---|---|---|---|
+| `ENABLED_PROVIDERS` | Worker | `codex,agy,opencode` | รายชื่อค่ายที่ต้องการเปิดใช้งานบน Worker container นี้ คั่นด้วย `,` (ใช้แยก Mode A / Mode B / Hybrid) |
+| `DEFAULT_MODEL` | API | *(ว่าง)* | โมเดลเริ่มต้นของ Codex เมื่อเรียก `codex-default` |
+| `AGY_DEFAULT_MODEL` | API | *(ว่าง)* | โมเดลเริ่มต้นของ Antigravity เมื่อเรียก `agy-default` |
+| `OPENCODE_DEFAULT_MODEL` | API | *(ว่าง)* | โมเดลเริ่มต้นของ OpenCode เมื่อเรียก `opencode-default` (แนะนำรูปแบบ `<provider>/<model>` เช่น `opencode-go/deepseek-v4.1-flash`) |
+| `OPENCODE_MODEL_FILTER` | Worker | *(ว่าง / `all`)* | กรองรายการโมเดลที่แสดงใน OpenCode: `all` (ทั้งหมด), `go` (`opencode-go/`), `zen` (`opencode/`), หรือระบุหลายค่ายคั่นด้วย `,` เช่น `go,anthropic` |
+| `<PROVIDER>_DEFAULT_MODEL` | API | *(ว่าง)* | รูปแบบมาตรฐานสำหรับค่ายใหม่ในอนาคต (เช่น `CLAUDE_DEFAULT_MODEL`) |
+
+### ตัวอย่างการตั้งค่า OpenCode เฉพาะแพ็กเกจ OpenCode Go
+
+```env
+OPENCODE_MODEL_FILTER=go
+OPENCODE_DEFAULT_MODEL=deepseek-v4.1-flash
+```
+
+> **หมายเหตุ**: เมื่อตั้ง `OPENCODE_MODEL_FILTER` เป็น provider เดียว (เช่น `go`) ระบบจะเติม prefix `opencode-go/` ให้ `OPENCODE_DEFAULT_MODEL` ที่ไม่ได้ใส่ `/` อัตโนมัติ (กลายเป็น `opencode-go/deepseek-v4.1-flash`) แต่หากตั้ง `OPENCODE_MODEL_FILTER=all` หรือระบุหลายค่าย แนะนำให้ใส่ชื่อเต็มแบบ `<provider>/<model>`
+
+### การอัปเดตค่า Config และล้าง Cache
+
+```powershell
+# นำค่า .env ใหม่ไปใช้กับ container
+docker compose up -d --build worker api
+
+# ล้าง cache รายการโมเดลใน Redis ทันที (ไม่ต้องรอหมดอายุ 5 นาที)
+docker compose exec redis redis-cli DEL gateway:provider:opencode:models
+```
