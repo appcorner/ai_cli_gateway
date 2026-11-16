@@ -1,6 +1,12 @@
 # AI CLI Gateway
 
+![AI CLI Gateway architecture and features](images/AI%20CLI%20Gateway.png)
+
 Private Docker-based HTTP gateway for **one user**: n8n -> FastAPI -> Redis -> worker -> Codex CLI or Google Antigravity CLI (`agy`). Includes a React management console. Redis is used as a volatile queue and short-lived job store; no database is used.
+
+### Dashboard preview
+
+![AI CLI Gateway dashboard](images/dashboard.png)
 
 ## Scope and warnings
 
