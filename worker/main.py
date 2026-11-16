@@ -413,8 +413,10 @@ def delete_agy_session(session_id):
     root = agy_cli_home()
     session_db = os.path.join(root, "conversations", session_id + ".db")
     summary_db = os.path.join(root, "conversation_summaries.db")
-    if not os.path.isfile(session_db):
-        raise FileNotFoundError("Antigravity conversation database was not found")
+    with AGY_SESSION_LOCK:
+        has_index_entry = session_id in read_agy_session_index()
+    if not os.path.isfile(session_db) and not has_index_entry:
+        raise FileNotFoundError("Antigravity conversation was not found")
     if os.path.isfile(summary_db):
         with sqlite3.connect(summary_db, timeout=10) as connection:
             tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()

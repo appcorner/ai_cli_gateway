@@ -118,7 +118,11 @@ function App(){
   const continueSession=async(session)=>{
     const {id,provider:sessionProvider='codex'}=session;
     const mode=session.mode||(sessionProvider==='agy'?'chat':'agent');
-    setProvider(sessionProvider);setSessionId(id);setSaveSession(true);if(sessionProvider==='codex')setExecutionMode(mode);else setAgyMode(mode);setSelectedModel(session.model||sessionProvider+'-default');setAnswer('');setAgyUsage(null);setChatMessages([]);setError('');setHistoryLoading(true);
+    const rawModel=session.model;
+    const nextModel=!rawModel||rawModel==='default'||rawModel===sessionProvider+'-default'
+      ?sessionProvider+'-default'
+      :rawModel.startsWith(sessionProvider+':')?rawModel:sessionProvider+':'+rawModel;
+    setProvider(sessionProvider);setSessionId(id);setSaveSession(true);if(sessionProvider==='codex')setExecutionMode(mode);else setAgyMode(mode);setSelectedModel(nextModel);setAnswer('');setAgyUsage(null);setChatMessages([]);setError('');setHistoryLoading(true);
     document.getElementById('tester')?.scrollIntoView({behavior:'smooth'});
     try{const history=await request('/admin/sessions/'+encodeURIComponent(id)+'?mode='+mode+'&provider='+sessionProvider);setChatMessages(history.messages||[])}
     catch(e){setError(e.message)}finally{setHistoryLoading(false)}

@@ -117,6 +117,21 @@ class AgyWorkerTests(unittest.TestCase):
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
+    def test_agy_delete_removes_registry_entry_when_db_missing(self):
+        session_id = "123e4567-e89b-42d3-a456-426614174000"
+        home = ROOT / "tests" / f"agy-delete-fixture-{uuid.uuid4().hex}"
+        try:
+            cli_home = home / ".gemini" / "antigravity-cli"
+            cli_home.mkdir(parents=True)
+            with patch.object(worker, "agy_cli_home", return_value=str(cli_home)), \
+                    patch.object(worker, "read_agy_session_index", return_value={session_id: {"id": session_id}}), \
+                    patch.object(worker, "write_agy_session_index") as write_index:
+                result = worker.delete_agy_session(session_id)
+            self.assertTrue(result["deleted"])
+            write_index.assert_called_once_with({})
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
     def test_agy_session_history_is_read_from_registry(self):
         with patch.object(worker, "read_agy_session_index", return_value={
                 "conv-123": {"messages": [{"role": "user", "content": "hello"}]}}):
