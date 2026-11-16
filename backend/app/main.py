@@ -9,7 +9,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from typing import Literal
-from .common import JOB_TTL_SECONDS, enqueue, fetch as _fetch, get_model_catalog, redis_client, public_job, session_control
+from .common import (
+    JOB_TTL_SECONDS,
+    enqueue,
+    fetch as _fetch,
+    get_model_catalog,
+    get_registered_providers,
+    public_job,
+    redis_client,
+    session_control,
+)
 
 API_KEY = os.getenv("GATEWAY_API_KEY", "")
 MODEL_DEFAULT = os.getenv("DEFAULT_MODEL", "")
@@ -67,7 +76,7 @@ class GatewayOptions(BaseModel):
     max_history_messages: int = Field(default=10, ge=1, le=50)
 
 class ChatRequest(BaseModel):
-    provider: Literal["codex", "agy"] | None = None
+    provider: str | None = None
     model: str = "codex-default"
     messages: list[Message] = Field(min_length=1, max_length=50)
     stream: bool = False
@@ -77,7 +86,7 @@ class ChatRequest(BaseModel):
     gateway_options: GatewayOptions | None = None
 
 class JobRequest(BaseModel):
-    provider: Literal["codex", "agy"] | None = None
+    provider: str | None = None
     prompt: str = Field(min_length=1, max_length=60000)
     model: str = "codex-default"
     session_id: str | None = None
@@ -85,31 +94,55 @@ class JobRequest(BaseModel):
     system_prompt: str | None = Field(default=None, max_length=20000)
     gateway_options: GatewayOptions | None = None
 
+def _configured_default_model(provider: str) -> str | None:
+    if provider == "codex":
+        return MODEL_DEFAULT or None
+    if provider == "agy":
+        return AGY_MODEL_DEFAULT or None
+    return os.getenv(f"{provider.upper()}_DEFAULT_MODEL", "") or None
+
+def validate_provider(provider: str, registered: dict[str, dict] | None = None) -> str:
+    providers = registered if registered is not None else get_registered_providers()
+    if provider not in providers:
+        raise HTTPException(400, f"Unknown or disabled provider: {provider}")
+    return provider
+
 def resolve_provider(model: str, provider: str | None = None):
-    if model.startswith("codex:"):
-        inferred = "codex"
-    elif model.startswith("agy:"):
-        inferred = "agy"
-    elif model == "agy-default":
-        inferred = "agy"
+    registered = get_registered_providers()
+    prefix = model.split(":", 1)[0] if ":" in model else None
+    has_known_prefix = prefix is not None and prefix in registered
+    if has_known_prefix:
+        inferred = prefix
+    elif model.endswith("-default") and model[:-8] in registered:
+        inferred = model[:-8]
     else:
-        inferred = "codex"
-    if provider and model.startswith(("codex:", "agy:")) and provider != inferred:
-        raise HTTPException(400, "Model provider prefix does not match provider field")
-    return provider or inferred
+        inferred = "codex" if "codex" in registered else next(iter(registered))
+    if provider:
+        validate_provider(provider, registered)
+        if has_known_prefix and provider != inferred:
+            raise HTTPException(400, "Model provider prefix does not match provider field")
+        return provider
+    return validate_provider(inferred, registered)
 
 def normalized_model(model: str, provider: str | None = None):
     provider = resolve_provider(model, provider)
-    if model.startswith(("codex:", "agy:")):
+    if ":" in model and model.split(":", 1)[0] == provider:
         model = model.split(":", 1)[1]
     if model in (f"{provider}-default", "default", "codex-default"):
-        return (AGY_MODEL_DEFAULT if provider == "agy" else MODEL_DEFAULT) or None
+        return _configured_default_model(provider)
     try:
         if any(item["id"] == model for item in get_model_catalog(provider)):
             return model
     except Exception as exc:
         raise HTTPException(503, f"{provider} model catalog unavailable: {type(exc).__name__}") from exc
     raise HTTPException(400, "Model must be a gateway model ID returned by /v1/models")
+
+def _default_mode_for(provider: str, session_id: str | None, registered: dict[str, dict] | None = None) -> str:
+    providers = registered if registered is not None else get_registered_providers()
+    caps = providers.get(provider, {}).get("capabilities", {})
+    if provider == "codex" and session_id:
+        return "agent"
+    return caps.get("default_mode", "chat")
 
 def fetch(job_id: str):
     job = _fetch(job_id)
@@ -125,9 +158,24 @@ def health():
     except Exception:
         raise HTTPException(503, "Dependencies unavailable")
 
+@app.get("/v1/providers", dependencies=[Depends(auth)])
+def list_providers():
+    registered = get_registered_providers()
+    data = [
+        {
+            "id": name,
+            "display_name": item.get("display_name", name.title()),
+            "default_model_alias": f"{name}-default",
+            "capabilities": item.get("capabilities", {}),
+        }
+        for name, item in registered.items()
+    ]
+    return {"object": "list", "data": data}
+
 @app.get("/v1/models", dependencies=[Depends(auth)])
-def models(provider: Literal["codex", "agy"] | None = None):
-    providers = [provider] if provider else ["codex", "agy"]
+def models(provider: str | None = None):
+    registered = get_registered_providers()
+    providers = [validate_provider(provider, registered)] if provider else list(registered.keys())
     data = []
     for item_provider in providers:
         try:
@@ -146,8 +194,7 @@ def models(provider: Literal["codex", "agy"] | None = None):
 @app.post("/v1/jobs", dependencies=[Depends(auth)], status_code=202)
 def submit(req: JobRequest):
     provider = resolve_provider(req.model, req.provider)
-    mode = req.gateway_options.mode if req.gateway_options else (
-        "chat" if provider == "agy" else ("agent" if req.session_id else "chat"))
+    mode = req.gateway_options.mode if req.gateway_options else _default_mode_for(provider, req.session_id)
     return {"id": enqueue(req.prompt, normalized_model(req.model, provider), req.session_id,
                            req.store_session, req.system_prompt, mode, provider), "status": "queued"}
 
@@ -158,8 +205,7 @@ def job_status(job_id: str):
 @app.post("/v1/chat/completions", dependencies=[Depends(auth)])
 async def chat(req: ChatRequest):
     provider = resolve_provider(req.model, req.provider)
-    mode = req.gateway_options.mode if req.gateway_options else (
-        "chat" if provider == "agy" else ("agent" if req.session_id else "chat"))
+    mode = req.gateway_options.mode if req.gateway_options else _default_mode_for(provider, req.session_id)
     max_history_messages = req.gateway_options.max_history_messages if req.gateway_options else 10
     if req.stream:
         raise HTTPException(400, "Streaming is not supported in MVP")
@@ -207,7 +253,7 @@ async def chat(req: ChatRequest):
 @app.get("/admin/overview", dependencies=[Depends(auth)])
 def overview():
     jobs = []
-    for key in redis_client.scan_iter(match="codex:job:*"):
+    for key in redis_client.scan_iter(match="gateway:job:*"):
         job_id = key.rsplit(":", 1)[-1]
         job = _fetch(job_id)
         if job:
@@ -216,8 +262,10 @@ def overview():
     counts = {}
     for job in jobs:
         counts[job["status"]] = counts.get(job["status"], 0) + 1
+    registered = get_registered_providers()
+    queue_depth = sum(redis_client.llen(f"gateway:jobs:{name}") for name in registered)
     return {"counts": counts, "jobs": [public_job(j) for j in jobs[:20]],
-            "queue_depth": redis_client.llen("codex:jobs"), "model": "codex-default",
+            "queue_depth": queue_depth, "model": "codex-default",
             "job_ttl_seconds": JOB_TTL_SECONDS}
 
 @app.get("/admin/jobs/{job_id}", dependencies=[Depends(auth)])
@@ -225,8 +273,9 @@ def admin_job(job_id: str):
     return {**fetch(job_id), "events": []}
 
 @app.get("/admin/usage", dependencies=[Depends(auth)])
-def usage(provider: Literal["codex", "agy"] = "codex"):
-    cache_key = f"{provider}:usage-limits"
+def usage(provider: str = "codex"):
+    validate_provider(provider)
+    cache_key = f"gateway:provider:{provider}:usage"
     cached = redis_client.get(cache_key)
     if cached:
         return json.loads(cached)
@@ -252,27 +301,42 @@ def usage(provider: Literal["codex", "agy"] = "codex"):
 
 @app.get("/admin/sessions", dependencies=[Depends(auth)])
 def admin_sessions():
+    registered = get_registered_providers()
+    sessions = []
     try:
-        sessions = session_control("list", mode="agent")
-        sessions += session_control("list", mode="chat")
-        sessions += session_control("list", provider="agy")
-        for item in sessions:
-            item.setdefault("provider", "codex")
+        for name, descriptor in registered.items():
+            caps = descriptor.get("capabilities", {})
+            if not caps.get("supports_sessions", True):
+                continue
+            list_modes = caps.get("session_list_modes") or []
+            if list_modes:
+                for list_mode in list_modes:
+                    items = session_control("list", mode=list_mode, provider=name)
+                    for item in items:
+                        item.setdefault("provider", name)
+                    sessions.extend(items)
+            else:
+                items = session_control("list", provider=name)
+                for item in items:
+                    item.setdefault("provider", name)
+                sessions.extend(items)
         return {"sessions": sessions}
     except Exception as exc:
-        raise HTTPException(503, f"Could not list Codex sessions: {type(exc).__name__}") from exc
+        raise HTTPException(503, f"Could not list sessions: {type(exc).__name__}") from exc
 
 @app.get("/admin/sessions/{session_id}", dependencies=[Depends(auth)])
 def admin_session_history(session_id: str, mode: Literal["chat", "agent"] = "agent",
-                          provider: Literal["codex", "agy"] = "codex"):
+                          provider: str = "codex"):
+    validate_provider(provider)
     try:
         return session_control("history", session_id, mode, provider=provider)
     except Exception as exc:
-        raise HTTPException(503, f"Could not read Codex session: {type(exc).__name__}") from exc
+        raise HTTPException(503, f"Could not read {provider} session: {type(exc).__name__}") from exc
 
 @app.delete("/admin/sessions/{session_id}", dependencies=[Depends(auth)])
 def delete_admin_session(session_id: str, mode: Literal["chat", "agent"] = "agent",
-                         provider: Literal["codex", "agy"] = "codex"):
+                         provider: str = "codex"):
+    validate_provider(provider)
     try:
         session_control("delete", session_id, mode, provider=provider)
         return {"id": session_id, "deleted": True}

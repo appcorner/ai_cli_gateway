@@ -19,20 +19,31 @@ redis = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
 TIMEOUT = max(10, min(int(os.environ.get("JOB_TIMEOUT_SECONDS", "120")), 900))
 CONCURRENCY = max(1, min(int(os.environ.get("MAX_CONCURRENT_JOBS", "1")), 4))
 JOB_TTL_SECONDS = max(60, int(os.environ.get("JOB_TTL_SECONDS", "3600")))
-WORKER_QUEUE_MODE = os.environ.get("WORKER_QUEUE_MODE", "shared").strip().lower()
+PROVIDERS_REGISTRY_KEY = "gateway:providers:registry"
 
 REGISTRY = build_registry(redis_client=redis, timeout_seconds=TIMEOUT)
 
 
 def _job_queue_keys() -> list[str]:
-    if WORKER_QUEUE_MODE == "dedicated":
-        return [f"gateway:jobs:{name}" for name in REGISTRY]
-    return ["codex:jobs"]
+    return [f"gateway:jobs:{name}" for name in REGISTRY]
+
+
+def register_providers() -> None:
+    mapping = {
+        name: json.dumps({
+            "name": provider.name,
+            "display_name": provider.display_name,
+            "capabilities": provider.capabilities.to_dict(),
+        })
+        for name, provider in REGISTRY.items()
+    }
+    if mapping:
+        redis.hset(PROVIDERS_REGISTRY_KEY, mapping=mapping)
 
 
 def execute(job_id: str) -> None:
     start = time.monotonic()
-    key = f"codex:job:{job_id}"
+    key = f"gateway:job:{job_id}"
     # Prompt leaves Redis as soon as the worker claims it; it is held only in memory
     # for this invocation and passed to the CLI through stdin.
     with redis.pipeline(transaction=True) as pipe:
@@ -87,7 +98,7 @@ def execute(job_id: str) -> None:
                 "result": result or "",
                 "error": error or "",
                 "session_id": session_id or "",
-                "agy_usage": json.dumps(usage) if usage else "",
+                "usage": json.dumps(usage) if usage else "",
                 "duration_ms": duration_ms,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             },
@@ -98,45 +109,34 @@ def execute(job_id: str) -> None:
     print(f"job={job_id} provider={provider_name} status={status} duration_ms={duration_ms}", flush=True)
 
 
-def model_catalog_loop(provider_name: str) -> None:
+def control_loop(provider_name: str) -> None:
     provider = REGISTRY[provider_name]
+    request_queue = f"gateway:provider:{provider_name}:control:requests"
     while True:
         try:
-            item = redis.brpop(f"{provider_name}:model-catalog:requests", timeout=3)
-            if not item:
-                continue
-            request_id = item[1]
-            response_key = f"{provider_name}:model-catalog:response:{request_id}"
-            try:
-                payload = {"models": provider.list_models()}
-            except Exception as exc:
-                payload = {"error": f"{provider_name} model discovery failed: {type(exc).__name__}"}
-            redis.setex(response_key, 120, json.dumps(payload))
-        except Exception as exc:
-            print(f"model catalog queue error ({provider_name}): {type(exc).__name__}", flush=True)
-            time.sleep(2)
-
-
-def session_control_loop(provider_name: str) -> None:
-    provider = REGISTRY[provider_name]
-    while True:
-        try:
-            item = redis.brpop(f"{provider_name}:session:requests", timeout=3)
+            item = redis.brpop(request_queue, timeout=3)
             if not item:
                 continue
             request = json.loads(item[1])
             request_id = request["request_id"]
-            response_key = f"{provider_name}:session:response:{request_id}"
+            operation = request["operation"]
+            response_key = f"gateway:provider:{provider_name}:control:response:{request_id}"
             try:
-                mode = request.get("mode", "agent")
-                operation = request["operation"]
-                session_id = request.get("session_id")
-                payload = {"result": provider.session_control(operation, session_id=session_id, mode=mode)}
+                if operation == "models":
+                    payload = {"result": provider.list_models()}
+                else:
+                    mode = request.get("mode", "agent")
+                    session_id = request.get("session_id")
+                    payload = {
+                        "result": provider.session_control(
+                            operation, session_id=session_id, mode=mode
+                        )
+                    }
             except Exception as exc:
-                payload = {"error": f"{provider_name} session operation failed: {type(exc).__name__}"}
+                payload = {"error": f"{provider_name} {operation} failed: {type(exc).__name__}"}
             redis.setex(response_key, 120, json.dumps(payload))
         except Exception as exc:
-            print(f"session control queue error ({provider_name}): {type(exc).__name__}", flush=True)
+            print(f"control queue error ({provider_name}): {type(exc).__name__}", flush=True)
             time.sleep(2)
 
 
@@ -157,8 +157,8 @@ if __name__ == "__main__":
     print(f"AI CLI Gateway worker started, concurrency={CONCURRENCY}, providers=[{enabled}]", flush=True)
     for name, provider in REGISTRY.items():
         provider.startup_init()
-        threading.Thread(target=model_catalog_loop, args=(name,), daemon=True).start()
-        threading.Thread(target=session_control_loop, args=(name,), daemon=True).start()
+        threading.Thread(target=control_loop, args=(name,), daemon=True).start()
+    register_providers()
     for _ in range(CONCURRENCY - 1):
         threading.Thread(target=loop, daemon=True).start()
     loop()

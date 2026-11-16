@@ -172,6 +172,7 @@ class CodexProvider(BaseCLIProvider):
         supports_session_delete=True,
         supports_usage_quota=True,
         supports_model_discovery=True,
+        session_list_modes=("agent", "chat"),
     )
 
     def execute_turn(self, req: ExecutionRequest) -> ExecutionResult:

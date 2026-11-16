@@ -26,6 +26,7 @@ class ProviderCapabilities:
     supports_session_delete: bool = False
     supports_usage_quota: bool = False
     supports_model_discovery: bool = True
+    session_list_modes: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -37,6 +38,7 @@ class ProviderCapabilities:
             "supports_session_delete": self.supports_session_delete,
             "supports_usage_quota": self.supports_usage_quota,
             "supports_model_discovery": self.supports_model_discovery,
+            "session_list_modes": list(self.session_list_modes),
         }
 
 

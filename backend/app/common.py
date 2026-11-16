@@ -1,5 +1,5 @@
-import os
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -10,9 +10,63 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 JOB_TTL_SECONDS = max(60, int(os.environ.get("JOB_TTL_SECONDS", "3600")))
 redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
 
+PROVIDERS_REGISTRY_KEY = "gateway:providers:registry"
+
+# Fallback descriptors used before a worker registers itself (or in unit tests).
+DEFAULT_PROVIDER_DESCRIPTORS = {
+    "codex": {
+        "name": "codex",
+        "display_name": "Codex CLI",
+        "capabilities": {
+            "modes": ["chat", "agent"],
+            "default_mode": "chat",
+            "supports_system_prompt": True,
+            "supports_sessions": True,
+            "supports_session_history": True,
+            "supports_session_delete": True,
+            "supports_usage_quota": True,
+            "supports_model_discovery": True,
+            "session_list_modes": ["agent", "chat"],
+        },
+    },
+    "agy": {
+        "name": "agy",
+        "display_name": "Antigravity CLI (agy)",
+        "capabilities": {
+            "modes": ["chat", "agent"],
+            "default_mode": "chat",
+            "supports_system_prompt": True,
+            "supports_sessions": True,
+            "supports_session_history": True,
+            "supports_session_delete": True,
+            "supports_usage_quota": True,
+            "supports_model_discovery": True,
+            "session_list_modes": [],
+        },
+    },
+}
+
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat()
+
+
+def get_registered_providers() -> dict[str, dict]:
+    """Read active provider descriptors from Redis, falling back to configured defaults."""
+    try:
+        raw = redis_client.hgetall(PROVIDERS_REGISTRY_KEY)
+    except Exception:
+        raw = {}
+    if raw:
+        providers = {}
+        for name, payload in raw.items():
+            try:
+                providers[name] = json.loads(payload)
+            except (TypeError, json.JSONDecodeError):
+                continue
+        if providers:
+            return providers
+    return {k: dict(v) for k, v in DEFAULT_PROVIDER_DESCRIPTORS.items()}
 
 
 def enqueue(prompt: str, model: str | None, session_id: str | None = None,
@@ -27,19 +81,19 @@ def enqueue(prompt: str, model: str | None, session_id: str | None = None,
            "provider": provider,
            "created_at": now, "finished_at": "", "result": "", "error": "", "duration_ms": ""}
     with redis_client.pipeline(transaction=True) as pipe:
-        pipe.hset(f"codex:job:{job_id}", mapping=job)
-        pipe.expire(f"codex:job:{job_id}", JOB_TTL_SECONDS)
-        pipe.lpush("codex:jobs", job_id)
+        pipe.hset(f"gateway:job:{job_id}", mapping=job)
+        pipe.expire(f"gateway:job:{job_id}", JOB_TTL_SECONDS)
+        pipe.lpush(f"gateway:jobs:{provider}", job_id)
         pipe.execute()
     return job_id
 
 
 def fetch(job_id: str):
-    job = redis_client.hgetall(f"codex:job:{job_id}")
+    job = redis_client.hgetall(f"gateway:job:{job_id}")
     if not job:
         return None
     try:
-        usage = json.loads(job.get("agy_usage") or "") or None
+        usage = json.loads(job.get("usage") or job.get("agy_usage") or "") or None
     except json.JSONDecodeError:
         usage = None
     return {"id": job["id"], "status": job["status"], "model": job.get("model") or None,
@@ -55,33 +109,11 @@ def public_job(job):
     return job
 
 
-def get_model_catalog(provider: str = "codex", timeout_seconds: int = 100):
-    cached = redis_client.get(f"{provider}:model-catalog")
-    if cached:
-        return json.loads(cached)
+def control_request(provider: str, operation: str, session_id: str | None = None,
+                    mode: str = "agent", timeout_seconds: int = 100):
     request_id = str(uuid.uuid4())
-    response_key = f"{provider}:model-catalog:response:{request_id}"
-    redis_client.lpush(f"{provider}:model-catalog:requests", request_id)
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        response = redis_client.get(response_key)
-        if response:
-            redis_client.delete(response_key)
-            payload = json.loads(response)
-            if payload.get("error"):
-                raise RuntimeError(payload["error"])
-            redis_client.setex(f"{provider}:model-catalog", 300, json.dumps(payload["models"]))
-            return payload["models"]
-        time.sleep(0.2)
-    redis_client.delete(response_key)
-    raise TimeoutError(f"Timed out waiting for {provider} model catalog")
-
-
-def session_control(operation: str, session_id: str | None = None, mode: str = "agent",
-                    timeout_seconds: int = 100, provider: str = "codex"):
-    request_id = str(uuid.uuid4())
-    response_key = f"{provider}:session:response:{request_id}"
-    redis_client.lpush(f"{provider}:session:requests", json.dumps({
+    response_key = f"gateway:provider:{provider}:control:response:{request_id}"
+    redis_client.lpush(f"gateway:provider:{provider}:control:requests", json.dumps({
         "request_id": request_id, "operation": operation, "session_id": session_id, "mode": mode
     }))
     deadline = time.monotonic() + timeout_seconds
@@ -95,4 +127,20 @@ def session_control(operation: str, session_id: str | None = None, mode: str = "
             return payload.get("result")
         time.sleep(0.2)
     redis_client.delete(response_key)
-    raise TimeoutError("Timed out waiting for session operation")
+    raise TimeoutError(f"Timed out waiting for {provider} {operation}")
+
+
+def get_model_catalog(provider: str = "codex", timeout_seconds: int = 100):
+    cache_key = f"gateway:provider:{provider}:models"
+    cached = redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+    models = control_request(provider, "models", timeout_seconds=timeout_seconds)
+    redis_client.setex(cache_key, 300, json.dumps(models))
+    return models
+
+
+def session_control(operation: str, session_id: str | None = None, mode: str = "agent",
+                    timeout_seconds: int = 100, provider: str = "codex"):
+    return control_request(provider, operation, session_id=session_id, mode=mode,
+                           timeout_seconds=timeout_seconds)

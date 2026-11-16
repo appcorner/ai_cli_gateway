@@ -216,12 +216,27 @@ class ProviderRegistryTests(unittest.TestCase):
         self.assertEqual(list(registry.keys()), ["agy"])
         self.assertTrue(registry["agy"].capabilities.supports_sessions)
 
-    def test_worker_queue_keys_support_shared_and_dedicated_modes(self):
-        with patch.object(worker, "WORKER_QUEUE_MODE", "shared"):
-            self.assertEqual(worker._job_queue_keys(), ["codex:jobs"])
-        with patch.object(worker, "WORKER_QUEUE_MODE", "dedicated"), \
-                patch.object(worker, "REGISTRY", {"agy": object()}):
-            self.assertEqual(worker._job_queue_keys(), ["gateway:jobs:agy"])
+    def test_worker_queue_keys_support_mode_a_and_mode_b(self):
+        with patch.object(worker, "REGISTRY", {"codex": object(), "agy": object()}):
+            self.assertEqual(worker._job_queue_keys(), ["gateway:jobs:codex", "gateway:jobs:agy"])
+        with patch.object(worker, "REGISTRY", {"opencode": object()}):
+            self.assertEqual(worker._job_queue_keys(), ["gateway:jobs:opencode"])
+
+    def test_dynamic_provider_routing_and_providers_endpoint(self):
+        custom_registry = {
+            "codex": {"name": "codex", "display_name": "Codex CLI", "capabilities": {"default_mode": "chat"}},
+            "opencode": {"name": "opencode", "display_name": "OpenCode CLI", "capabilities": {"default_mode": "chat"}},
+        }
+        client = TestClient(api.app)
+        with patch.object(api, "API_KEY", "test-key"), \
+                patch.object(api, "get_registered_providers", return_value=custom_registry):
+            resp = client.get("/v1/providers", headers={"Authorization": "Bearer test-key"})
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual([item["id"] for item in resp.json()["data"]], ["codex", "opencode"])
+            self.assertEqual(api.resolve_provider("opencode:claude-sonnet"), "opencode")
+            self.assertEqual(api.resolve_provider("opencode-default"), "opencode")
+            with self.assertRaises(api.HTTPException):
+                api.validate_provider("unknown_cli", custom_registry)
 
 
 if __name__ == "__main__":
