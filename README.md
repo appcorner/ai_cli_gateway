@@ -239,20 +239,22 @@ docker compose exec worker opencode --version
 docker compose exec worker opencode models
 ```
 
-If the worker reports authentication, model access or usage-limit errors, verify the actual sign-in/plan. If the Codex CLI flags differ in a future version, check `codex exec --help` and adapt `worker/main.py`.
+If the worker reports authentication, model access or usage-limit errors, verify the actual sign-in/plan. If the Codex CLI flags differ in a future version, check `codex exec --help` and adapt `worker/providers/codex.py`.
 
 ## Architecture
 
 ```text
-n8n Docker --HTTP POST--> web nginx :8088 (host) / api:8000 (docker network)
-                                 |
-                              FastAPI
-                              |      |
-                                   Redis memory queue
+n8n Docker / Web UI --HTTP--> web nginx :8088 (host) / api:8000 (docker network)
                                      |
-                                  worker
-                              /           \\
-             Codex CLI (exec/app-server)   Antigravity CLI (headless)
-                       |                            |
-             ChatGPT sign-in              Google account OAuth
+                                  FastAPI (dynamic provider registry)
+                                  |     |
+                          Redis memory bus (gateway:jobs:{provider})
+                                     |
+                          worker (worker/providers/)
+                   /                 |                 \
+  Codex CLI (exec/app-server)  Antigravity CLI    OpenCode CLI (run --format json)
+            |                        |                       |
+     ChatGPT sign-in        Google account OAuth     OpenCode Go / Zen / API keys
 ```
+
+For full details on the extensible `BaseCLIProvider` adapter architecture, unified Redis protocol, and Mode A / Mode B worker scaling, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
