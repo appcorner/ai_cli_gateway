@@ -32,7 +32,7 @@ async def lifespan(app):
     redis_client.ping()
     yield
 
-app = FastAPI(title="Personal AI CLI Gateway", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Personal AI CLI Gateway", version="0.2.0", lifespan=lifespan)
 
 @app.middleware("http")
 async def log_request_body(request, call_next):
@@ -154,7 +154,7 @@ def fetch(job_id: str):
 def health():
     try:
         redis_client.ping()
-        return {"status": "ok", "queue": "redis-memory-only"}
+        return {"status": "ok", "queue": "redis-memory-only", "version": app.version}
     except Exception:
         raise HTTPException(503, "Dependencies unavailable")
 
@@ -266,7 +266,8 @@ def overview():
     queue_depth = sum(redis_client.llen(f"gateway:jobs:{name}") for name in registered)
     return {"counts": counts, "jobs": [public_job(j) for j in jobs[:20]],
             "queue_depth": queue_depth, "model": "codex-default",
-            "job_ttl_seconds": JOB_TTL_SECONDS}
+            "job_ttl_seconds": JOB_TTL_SECONDS,
+            "gateway_version": app.version}
 
 @app.get("/admin/jobs/{job_id}", dependencies=[Depends(auth)])
 def admin_job(job_id: str):

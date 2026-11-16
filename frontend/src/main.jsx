@@ -19,6 +19,54 @@ import {
 } from 'lucide-react';
 import './style.css';
 
+const UI_VERSION =
+  typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.2.0';
+const UI_BUILD_TIME =
+  typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'dev';
+
+const DEFAULT_PROVIDERS = [
+  {
+    id: 'codex',
+    display_name: 'Codex CLI',
+    default_model_alias: 'codex-default',
+    capabilities: {
+      modes: ['chat', 'agent'],
+      default_mode: 'chat',
+      supports_system_prompt: true,
+      supports_sessions: true,
+      supports_session_history: true,
+      supports_session_delete: true,
+      supports_usage_quota: true,
+      supports_model_discovery: true,
+    },
+  },
+  {
+    id: 'agy',
+    display_name: 'Antigravity CLI (agy)',
+    default_model_alias: 'agy-default',
+    capabilities: {
+      modes: ['chat', 'agent'],
+      default_mode: 'chat',
+      supports_system_prompt: true,
+      supports_sessions: true,
+      supports_session_history: true,
+      supports_session_delete: true,
+      supports_usage_quota: true,
+      supports_model_discovery: true,
+    },
+  },
+];
+
+function formatModeLabel(providerId, mode) {
+  if (providerId === 'agy') {
+    if (mode === 'chat') return 'Chat · slash & skill expansion off';
+    if (mode === 'agent') return 'Normal · full CLI behavior';
+  }
+  if (mode === 'chat') return 'Chat · lightweight';
+  if (mode === 'agent') return 'Agent · full config';
+  return mode;
+}
+
 const TABS = [
   { id: 'overview', label: 'Overview', icon: Activity },
   { id: 'tester', label: 'Chat Tester', icon: Send },
@@ -87,9 +135,9 @@ function App() {
   });
 
   const [overview, setOverview] = useState(null);
-  const [codexUsage, setCodexUsage] = useState(null);
-  const [agyLimits, setAgyLimits] = useState(null);
-  const [usageLoading, setUsageLoading] = useState({ codex: false, agy: false });
+  const [providers, setProviders] = useState(DEFAULT_PROVIDERS);
+  const [usageByProvider, setUsageByProvider] = useState({});
+  const [usageLoading, setUsageLoading] = useState({});
   const [overviewLoading, setOverviewLoading] = useState(false);
 
   const [error, setError] = useState('');
@@ -102,9 +150,8 @@ function App() {
   const [modelCatalog, setModelCatalog] = useState([]);
   const [provider, setProvider] = useState('codex');
   const [selectedModel, setSelectedModel] = useState('codex-default');
-  const [executionMode, setExecutionMode] = useState('chat');
-  const [agyMode, setAgyMode] = useState('chat');
-  const [agyUsage, setAgyUsage] = useState(null);
+  const [modeByProvider, setModeByProvider] = useState({});
+  const [lastUsage, setLastUsage] = useState(null);
 
   const [sessions, setSessions] = useState([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
@@ -128,6 +175,16 @@ function App() {
   const [systemPromptName, setSystemPromptName] = useState('');
 
   const chatTranscriptRef = useRef(null);
+
+  const providerMap = Object.fromEntries(providers.map((p) => [p.id, p]));
+  const getProviderLabel = (id) => providerMap[id]?.display_name || id;
+  const currentProvider = providerMap[provider] || providers[0];
+  const currentCaps = currentProvider?.capabilities || {};
+  const currentModes = currentCaps.modes?.length ? currentCaps.modes : ['chat'];
+  const currentMode =
+    modeByProvider[provider] ||
+    (currentModes.includes(currentCaps.default_mode) ? currentCaps.default_mode : currentModes[0]);
+  const usageProviders = providers.filter((p) => p.capabilities?.supports_usage_quota !== false);
 
   const navigate = useCallback((tab) => {
     setActiveTab(tab);
@@ -183,32 +240,54 @@ function App() {
     }
   }, [token, request]);
 
+  const refreshProviders = useCallback(async () => {
+    if (!token) return DEFAULT_PROVIDERS;
+    try {
+      const result = await request('/v1/providers');
+      const items = Array.isArray(result.data) && result.data.length > 0 ? result.data : DEFAULT_PROVIDERS;
+      setProviders(items);
+      setProvider((current) => {
+        if (items.some((item) => item.id === current)) return current;
+        const next = items[0].id;
+        setSelectedModel(`${next}-default`);
+        return next;
+      });
+      return items;
+    } catch {
+      return DEFAULT_PROVIDERS;
+    }
+  }, [token, request]);
+
   const refreshUsage = useCallback(
-    async (target = 'all') => {
+    async (target = 'all', providerList = providers) => {
       if (!token) return;
-      const targets = target === 'all' ? ['codex', 'agy'] : [target];
-      setUsageLoading((prev) => ({
-        ...prev,
-        ...(targets.includes('codex') ? { codex: true } : {}),
-        ...(targets.includes('agy') ? { agy: true } : {}),
-      }));
+      const targets =
+        target === 'all'
+          ? providerList
+              .filter((p) => p.capabilities?.supports_usage_quota !== false)
+              .map((p) => p.id)
+          : [target];
+      if (!targets.length) return;
+      setUsageLoading((prev) => {
+        const next = { ...prev };
+        for (const cli of targets) next[cli] = true;
+        return next;
+      });
 
       await Promise.all(
         targets.map(async (cli) => {
           try {
-            const data = await request(`/admin/usage?provider=${cli}`);
-            if (cli === 'codex') setCodexUsage(data);
-            else setAgyLimits(data);
+            const data = await request(`/admin/usage?provider=${encodeURIComponent(cli)}`);
+            setUsageByProvider((prev) => ({ ...prev, [cli]: data }));
           } catch (e) {
-            if (cli === 'codex') setCodexUsage({ error: e.message });
-            else setAgyLimits({ error: e.message });
+            setUsageByProvider((prev) => ({ ...prev, [cli]: { error: e.message } }));
           } finally {
             setUsageLoading((prev) => ({ ...prev, [cli]: false }));
           }
         })
       );
     },
-    [token, request]
+    [token, request, providers]
   );
 
   const refreshModels = useCallback(
@@ -240,19 +319,23 @@ function App() {
 
   useEffect(() => {
     if (!token) return;
+    let cancelled = false;
+    refreshProviders().then((items) => {
+      if (!cancelled) refreshUsage('all', items);
+    });
     refreshOverview();
-    refreshUsage('all');
     refreshSessions();
 
     const overviewTimer = setInterval(refreshOverview, 15000);
     const usageTimer = setInterval(() => refreshUsage('all'), 60000);
     const sessionTimer = setInterval(refreshSessions, 60000);
     return () => {
+      cancelled = true;
       clearInterval(overviewTimer);
       clearInterval(usageTimer);
       clearInterval(sessionTimer);
     };
-  }, [token, refreshOverview, refreshUsage, refreshSessions]);
+  }, [token, refreshProviders, refreshOverview, refreshUsage, refreshSessions]);
 
   useEffect(() => {
     if (!token) return;
@@ -282,12 +365,12 @@ function App() {
     sessionStorage.removeItem('gatewayToken');
     setToken('');
     setOverview(null);
-    setCodexUsage(null);
-    setAgyLimits(null);
+    setUsageByProvider({});
     setSessions([]);
     setChatMessages([]);
     setSessionId('');
     setSaveSession(false);
+    setLastUsage(null);
     setError('');
   };
 
@@ -296,7 +379,7 @@ function App() {
     setSaveSession(true);
     setChatMessages([]);
     setPrompt('');
-    setAgyUsage(null);
+    setLastUsage(null);
     setError('');
   };
 
@@ -305,7 +388,7 @@ function App() {
     setSaveSession(false);
     setChatMessages([]);
     setPrompt('');
-    setAgyUsage(null);
+    setLastUsage(null);
     setError('');
   };
 
@@ -360,7 +443,7 @@ function App() {
     if (!userMessage || sending) return;
 
     setSending(true);
-    setAgyUsage(null);
+    setLastUsage(null);
     setError('');
 
     const updatedMessages = [...chatMessages, { role: 'user', content: userMessage }];
@@ -380,17 +463,17 @@ function App() {
             ? [{ role: 'user', content: userMessage }]
             : updatedMessages.slice(-10),
           stream: false,
-          session_id: saveSession ? sessionId || null : null,
-          store_session: saveSession && !sessionId,
-          system_prompt: systemPrompt.trim() || null,
+          session_id: currentCaps.supports_sessions !== false && saveSession ? sessionId || null : null,
+          store_session: currentCaps.supports_sessions !== false && saveSession && !sessionId,
+          system_prompt: currentCaps.supports_system_prompt !== false ? systemPrompt.trim() || null : null,
           gateway_options: {
-            mode: provider === 'agy' ? agyMode : executionMode,
+            mode: currentMode,
             max_history_messages: 10,
           },
         }),
       });
       const reply = result.choices?.[0]?.message?.content || '(empty)';
-      setAgyUsage(provider === 'agy' ? result.usage || null : null);
+      setLastUsage(result.usage || null);
       setChatMessages((current) => {
         const next = [...current, { role: 'assistant', content: reply }];
         return sessionId || result.session_id ? next : next.slice(-10);
@@ -410,7 +493,7 @@ function App() {
   };
 
   const deleteSession = async (session) => {
-    const label = session.provider === 'agy' ? 'Antigravity' : 'Codex';
+    const label = getProviderLabel(session.provider || 'codex');
     if (
       !window.confirm(
         `ลบ session ${label} นี้พร้อมประวัติข้อความถาวรใช่ไหมคะ?`
@@ -437,7 +520,11 @@ function App() {
 
   const continueSession = async (session) => {
     const { id, provider: sessionProvider = 'codex' } = session;
-    const mode = session.mode || (sessionProvider === 'agy' ? 'chat' : 'agent');
+    const targetDescriptor = providerMap[sessionProvider];
+    const mode =
+      session.mode ||
+      targetDescriptor?.capabilities?.default_mode ||
+      'chat';
     const rawModel = session.model;
     const nextModel =
       !rawModel ||
@@ -451,13 +538,9 @@ function App() {
     setProvider(sessionProvider);
     setSessionId(id);
     setSaveSession(true);
-    if (sessionProvider === 'codex') {
-      setExecutionMode(mode);
-    } else {
-      setAgyMode(mode);
-    }
+    setModeByProvider((prev) => ({ ...prev, [sessionProvider]: mode }));
     setSelectedModel(nextModel);
-    setAgyUsage(null);
+    setLastUsage(null);
     setChatMessages([]);
     setError('');
     setHistoryLoading(true);
@@ -529,7 +612,7 @@ function App() {
 
   const counts = overview?.counts || {};
   const runningCount = counts.running ?? 0;
-  const anyUsageLoading = usageLoading.codex || usageLoading.agy;
+  const anyUsageLoading = Object.values(usageLoading).some(Boolean);
   const hasSelectedInCatalog = modelCatalog.some((m) => m.id === selectedModel);
 
   const filteredSessions = sessions.filter((s) => {
@@ -551,7 +634,7 @@ function App() {
     },
     tester: {
       title: 'Chat Tester',
-      subtitle: 'Interactive prompt testing for Codex CLI and Antigravity CLI',
+      subtitle: `Interactive prompt testing for ${providers.map((p) => p.display_name).join(', ')}`,
     },
     sessions: {
       title: 'Saved CLI Sessions',
@@ -614,6 +697,12 @@ function App() {
           })}
         </nav>
         <div className="aside-foot">
+          {!sidebarCollapsed && (
+            <small className="muted" title={`UI build: ${UI_BUILD_TIME}`}>
+              UI v{UI_VERSION} · {UI_BUILD_TIME.slice(0, 16).replace('T', ' ')}
+              {overview?.gateway_version ? ` · API v${overview.gateway_version}` : ''}
+            </small>
+          )}
           <button
             type="button"
             className="ghost"
@@ -748,117 +837,88 @@ function App() {
                 >
                   <span>Saved CLI Sessions</span>
                   <strong>{sessions.length}</strong>
-                  <small>Codex and Antigravity</small>
+                  <small>{providers.map((p) => p.display_name).join(', ')}</small>
                 </article>
               </section>
 
-              <section className="panel usage-panel">
-                <div className="section-title">
-                  <h2>Codex Usage Limits</h2>
-                  <div className="section-actions">
-                    <span className="muted">
-                      {codexUsage?.fetched_at
-                        ? `Updated ${formatDate(codexUsage.fetched_at)}`
-                        : 'Account status'}
-                    </span>
-                    <button
-                      type="button"
-                      className="secondary compact-btn"
-                      disabled={usageLoading.codex}
-                      onClick={() => refreshUsage('codex')}
-                    >
-                      <RefreshCw
-                        size={14}
-                        className={usageLoading.codex ? 'spin' : ''}
-                      />
-                      Refresh
-                    </button>
-                  </div>
-                </div>
-                {codexUsage?.error ? (
-                  <p className="usage-note">
-                    Could not read usage limits ({codexUsage.error}). Check
-                    Codex sign-in and refresh.
-                  </p>
-                ) : codexUsage?.primary || codexUsage?.secondary ? (
-                  <div className="usage-grid">
-                    <UsageWindow
-                      title="Current limit"
-                      windowData={codexUsage.primary}
-                    />
-                    <UsageWindow
-                      title="Weekly limit"
-                      windowData={codexUsage.secondary}
-                    />
-                  </div>
-                ) : (
-                  <p className="usage-note">
-                    Loading usage limits from the signed-in Codex account…
-                  </p>
-                )}
-              </section>
-
-              <section className="panel usage-panel">
-                <div className="section-title">
-                  <h2>Antigravity Usage Limits</h2>
-                  <div className="section-actions">
-                    <span className="muted">
-                      {agyLimits?.fetched_at
-                        ? `Updated ${formatDate(agyLimits.fetched_at)}`
-                        : 'Google account quota'}
-                    </span>
-                    <button
-                      type="button"
-                      className="secondary compact-btn"
-                      disabled={usageLoading.agy}
-                      onClick={() => refreshUsage('agy')}
-                    >
-                      <RefreshCw
-                        size={14}
-                        className={usageLoading.agy ? 'spin' : ''}
-                      />
-                      Refresh
-                    </button>
-                  </div>
-                </div>
-                {agyLimits?.error ? (
-                  <p className="usage-note">
-                    Could not read Antigravity usage ({agyLimits.error}). Check
-                    Google sign-in and refresh.
-                  </p>
-                ) : agyLimits?.groups?.length ? (
-                  <div className="usage-grid agy-usage-grid">
-                    {agyLimits.groups.map((group) => (
-                      <article className="agy-usage-group" key={group.name}>
-                        <div className="agy-usage-group-title">
-                          <h3>{group.name}</h3>
-                          {group.description && <p>{group.description}</p>}
-                        </div>
-                        <div className="agy-usage-buckets">
-                          {group.buckets.map((bucket) => (
-                            <UsageWindow
-                              key={bucket.id || bucket.name}
-                              title={bucket.name}
-                              windowData={{
-                                used_percent:
-                                  bucket.remaining_fraction == null
-                                    ? null
-                                    : (1 - bucket.remaining_fraction) * 100,
-                                window_label: bucket.window,
-                                resets_at: bucket.reset_time,
-                              }}
-                            />
-                          ))}
-                        </div>
-                      </article>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="usage-note">
-                    Loading usage limits from the signed-in Google account…
-                  </p>
-                )}
-              </section>
+              {usageProviders.map((item) => {
+                const usageData = usageByProvider[item.id];
+                const isLoading = !!usageLoading[item.id];
+                return (
+                  <section className="panel usage-panel" key={item.id}>
+                    <div className="section-title">
+                      <h2>{item.display_name} Usage Limits</h2>
+                      <div className="section-actions">
+                        <span className="muted">
+                          {usageData?.fetched_at
+                            ? `Updated ${formatDate(usageData.fetched_at)}`
+                            : 'Account status'}
+                        </span>
+                        <button
+                          type="button"
+                          className="secondary compact-btn"
+                          disabled={isLoading}
+                          onClick={() => refreshUsage(item.id)}
+                        >
+                          <RefreshCw
+                            size={14}
+                            className={isLoading ? 'spin' : ''}
+                          />
+                          Refresh
+                        </button>
+                      </div>
+                    </div>
+                    {usageData?.error ? (
+                      <p className="usage-note">
+                        Could not read usage limits ({usageData.error}). Check{' '}
+                        {item.display_name} sign-in and refresh.
+                      </p>
+                    ) : usageData?.groups?.length ? (
+                      <div className="usage-grid agy-usage-grid">
+                        {usageData.groups.map((group) => (
+                          <article className="agy-usage-group" key={group.name}>
+                            <div className="agy-usage-group-title">
+                              <h3>{group.name}</h3>
+                              {group.description && <p>{group.description}</p>}
+                            </div>
+                            <div className="agy-usage-buckets">
+                              {group.buckets.map((bucket) => (
+                                <UsageWindow
+                                  key={bucket.id || bucket.name}
+                                  title={bucket.name}
+                                  windowData={{
+                                    used_percent:
+                                      bucket.remaining_fraction == null
+                                        ? null
+                                        : (1 - bucket.remaining_fraction) * 100,
+                                    window_label: bucket.window,
+                                    resets_at: bucket.reset_time,
+                                  }}
+                                />
+                              ))}
+                            </div>
+                          </article>
+                        ))}
+                      </div>
+                    ) : usageData?.primary || usageData?.secondary ? (
+                      <div className="usage-grid">
+                        <UsageWindow
+                          title="Current limit"
+                          windowData={usageData.primary}
+                        />
+                        <UsageWindow
+                          title="Weekly limit"
+                          windowData={usageData.secondary}
+                        />
+                      </div>
+                    ) : (
+                      <p className="usage-note">
+                        Loading usage limits from {item.display_name}…
+                      </p>
+                    )}
+                  </section>
+                );
+              })}
             </>
           )}
 
@@ -880,39 +940,34 @@ function App() {
                         const next = e.target.value;
                         setProvider(next);
                         setSelectedModel(`${next}-default`);
+                        setLastUsage(null);
                       }}
                     >
-                      <option value="codex">Codex CLI</option>
-                      <option value="agy">Antigravity CLI (agy)</option>
+                      {providers.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.display_name}
+                        </option>
+                      ))}
                     </select>
                   </label>
 
                   <label>
                     Mode
                     <select
-                      value={provider === 'agy' ? agyMode : executionMode}
+                      value={currentMode}
                       disabled={!!sessionId}
                       onChange={(e) =>
-                        provider === 'agy'
-                          ? setAgyMode(e.target.value)
-                          : setExecutionMode(e.target.value)
+                        setModeByProvider((prev) => ({
+                          ...prev,
+                          [provider]: e.target.value,
+                        }))
                       }
                     >
-                      {provider === 'agy' ? (
-                        <>
-                          <option value="chat">
-                            Chat · slash &amp; skill expansion off
-                          </option>
-                          <option value="agent">
-                            Normal · full CLI behavior
-                          </option>
-                        </>
-                      ) : (
-                        <>
-                          <option value="chat">Chat · lightweight</option>
-                          <option value="agent">Agent · full config</option>
-                        </>
-                      )}
+                      {currentModes.map((m) => (
+                        <option key={m} value={m}>
+                          {formatModeLabel(provider, m)}
+                        </option>
+                      ))}
                     </select>
                   </label>
 
@@ -936,17 +991,19 @@ function App() {
                 </div>
 
                 <div className="chat-actions">
-                  <label className="session-toggle">
-                    <input
-                      type="checkbox"
-                      checked={saveSession}
-                      onChange={(e) => {
-                        setSaveSession(e.target.checked);
-                        if (!e.target.checked) setSessionId('');
-                      }}
-                    />
-                    Save conversation
-                  </label>
+                  {currentCaps.supports_sessions !== false && (
+                    <label className="session-toggle">
+                      <input
+                        type="checkbox"
+                        checked={saveSession}
+                        onChange={(e) => {
+                          setSaveSession(e.target.checked);
+                          if (!e.target.checked) setSessionId('');
+                        }}
+                      />
+                      Save conversation
+                    </label>
+                  )}
                   <button type="button" className="secondary" onClick={newChat}>
                     <Plus size={15} /> New chat
                   </button>
@@ -955,7 +1012,7 @@ function App() {
 
               {provider === 'agy' && (
                 <small className="composer-hint">
-                  {agyMode === 'chat'
+                  {currentMode === 'chat'
                     ? 'Chat mode disables slash-command and skill expansion. Core instructions and global/plugin rules may still add context.'
                     : 'Normal mode keeps agy slash commands and skills enabled.'}
                 </small>
@@ -984,10 +1041,11 @@ function App() {
                 </div>
               )}
 
-              <details
-                className="system-prompt-settings"
-                open={!!systemPrompt}
-              >
+              {currentCaps.supports_system_prompt !== false && (
+                <details
+                  className="system-prompt-settings"
+                  open={!!systemPrompt}
+                >
                 <summary>
                   System prompt{' '}
                   <span>{systemPrompt ? 'Configured' : 'Optional'}</span>
@@ -1047,7 +1105,8 @@ function App() {
                   onChange={(e) => setSystemPrompt(e.target.value)}
                   placeholder="Set the assistant's role and response style"
                 />
-              </details>
+                </details>
+              )}
 
               <div
                 className="chat-transcript"
@@ -1104,7 +1163,7 @@ function App() {
                       sendMessage();
                     }
                   }}
-                  placeholder={`Message ${provider === 'agy' ? 'Antigravity' : 'Codex'}… (Enter to send, Shift+Enter for a new line)`}
+                  placeholder={`Message ${getProviderLabel(provider)}… (Enter to send, Shift+Enter for a new line)`}
                 />
                 <button
                   type="button"
@@ -1117,23 +1176,23 @@ function App() {
                 </button>
               </div>
 
-              {provider === 'agy' && agyUsage && (
+              {lastUsage && (
                 <small
                   className="composer-hint"
-                  title="agy usage counters can be cumulative for a saved conversation"
+                  title="usage counters reported by the CLI"
                 >
-                  agy usage · input {agyUsage.input_tokens ?? '—'} · output{' '}
-                  {agyUsage.output_tokens ?? '—'} · thinking{' '}
-                  {agyUsage.thinking_tokens ?? '—'} · cache{' '}
-                  {agyUsage.cache_read_tokens ?? '—'}
+                  {provider} usage · input {lastUsage.input_tokens ?? '—'} · output{' '}
+                  {lastUsage.output_tokens ?? '—'} · thinking{' '}
+                  {lastUsage.thinking_tokens ?? '—'} · cache{' '}
+                  {lastUsage.cache_read_tokens ?? '—'}
                 </small>
               )}
               <small className="composer-hint">
                 {sessionId
                   ? 'Continuing this saved session.'
-                  : provider === 'agy'
+                  : currentCaps.supports_sessions !== false
                     ? 'Save conversation to resume it later from Sessions.'
-                    : 'Chat context is kept in this tab unless you save the conversation.'}
+                    : 'This provider runs statelessly; chat context is kept in this tab.'}
               </small>
             </section>
           )}
@@ -1154,14 +1213,15 @@ function App() {
                 <div className="filter-pills">
                   {[
                     { id: 'all', label: `All (${sessions.length})` },
-                    {
-                      id: 'codex',
-                      label: `Codex (${sessions.filter((s) => (s.provider || 'codex') === 'codex').length})`,
-                    },
-                    {
-                      id: 'agy',
-                      label: `Antigravity (${sessions.filter((s) => s.provider === 'agy').length})`,
-                    },
+                    ...Array.from(
+                      new Set([
+                        ...providers.map((p) => p.id),
+                        ...sessions.map((s) => s.provider || 'codex'),
+                      ])
+                    ).map((pid) => ({
+                      id: pid,
+                      label: `${getProviderLabel(pid)} (${sessions.filter((s) => (s.provider || 'codex') === pid).length})`,
+                    })),
                   ].map((item) => (
                     <button
                       key={item.id}
@@ -1200,7 +1260,7 @@ function App() {
                         key={`${s.provider || 'codex'}:${s.mode || ''}:${s.id}`}
                       >
                         <td>
-                          {s.provider === 'agy' ? 'Antigravity' : 'Codex'}
+                          {getProviderLabel(s.provider || 'codex')}
                           {s.mode ? ` · ${s.mode}` : ''}
                         </td>
                         <td title={s.id}>
@@ -1270,7 +1330,7 @@ function App() {
                         <td title={j.id}>
                           <code>{j.id.slice(0, 8)}</code>
                         </td>
-                        <td>{j.provider === 'agy' ? 'Antigravity' : 'Codex'}</td>
+                        <td>{getProviderLabel(j.provider || 'codex')}</td>
                         <td>{j.model || 'default'}</td>
                         <td>
                           <span className={`status ${j.status}`}>
@@ -1302,8 +1362,12 @@ function App() {
           )}
 
           <footer>
-            <Server size={14} /> Local-first MVP · Session history is stored on
-            disk · Do not expose publicly
+            <Server size={14} /> Local-first MVP · UI v{UI_VERSION} (build{' '}
+            {UI_BUILD_TIME.slice(0, 19).replace('T', ' ')}Z)
+            {overview?.gateway_version
+              ? ` · API v${overview.gateway_version}`
+              : ''}{' '}
+            · Do not expose publicly
           </footer>
         </div>
       </main>
