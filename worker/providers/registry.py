@@ -6,10 +6,12 @@ from typing import Any
 from .agy import AgyProvider
 from .base import BaseCLIProvider
 from .codex import CodexProvider
+from .opencode import OpenCodeProvider
 
 PROVIDER_CLASSES: dict[str, type[BaseCLIProvider]] = {
     "codex": CodexProvider,
     "agy": AgyProvider,
+    "opencode": OpenCodeProvider,
 }
 
 

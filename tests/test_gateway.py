@@ -26,6 +26,7 @@ worker = importlib.util.module_from_spec(worker_spec)
 worker_spec.loader.exec_module(worker)
 
 from providers import agy as agy_provider  # noqa: E402
+from providers import opencode as opencode_provider  # noqa: E402
 from providers import build_registry, parse_enabled_providers  # noqa: E402
 
 
@@ -205,9 +206,9 @@ class AgyWorkerTests(unittest.TestCase):
 
 class ProviderRegistryTests(unittest.TestCase):
     def test_parse_enabled_providers_supports_mode_a_and_mode_b(self):
-        self.assertEqual(parse_enabled_providers(""), ["codex", "agy"])
+        self.assertEqual(parse_enabled_providers(""), ["codex", "agy", "opencode"])
         self.assertEqual(parse_enabled_providers("codex, agy"), ["codex", "agy"])
-        self.assertEqual(parse_enabled_providers("agy"), ["agy"])
+        self.assertEqual(parse_enabled_providers("opencode"), ["opencode"])
         with self.assertRaises(ValueError):
             parse_enabled_providers("codex,unknown_cli")
 
@@ -237,6 +238,52 @@ class ProviderRegistryTests(unittest.TestCase):
             self.assertEqual(api.resolve_provider("opencode-default"), "opencode")
             with self.assertRaises(api.HTTPException):
                 api.validate_provider("unknown_cli", custom_registry)
+
+
+class OpenCodeWorkerTests(unittest.TestCase):
+    def test_model_catalog_parses_provider_slash_model(self):
+        completed = type("Completed", (), {
+            "stdout": "anthropic/claude-sonnet-4-5\nopenai/gpt-4o\ninvalid-line\n",
+            "returncode": 0,
+        })()
+        with patch.object(opencode_provider.subprocess, "run", return_value=completed):
+            models = opencode_provider.read_models_from_opencode()
+        self.assertEqual([item["id"] for item in models], ["anthropic/claude-sonnet-4-5", "openai/gpt-4o"])
+
+    def test_run_opencode_turn_parses_jsonl_and_passes_prompt(self):
+        stdout = "\n".join([
+            '{"type":"step_start","sessionID":"ses_abc123"}',
+            '{"type":"text","sessionID":"ses_abc123","part":{"type":"text","text":"Hello "}}',
+            '{"type":"text","sessionID":"ses_abc123","part":{"type":"text","text":"world"}}',
+            '{"type":"step_finish","sessionID":"ses_abc123","part":{"type":"step-finish","tokens":{"input":10,"output":5,"reasoning":1,"cache":{"read":2}}}}',
+        ])
+        completed = type("Completed", (), {"stdout": stdout, "returncode": 0})()
+        with patch.object(opencode_provider.subprocess, "run", return_value=completed) as run, \
+                patch.object(opencode_provider.tempfile, "TemporaryDirectory", workspace_temporary_directory):
+            answer, session_id, usage = opencode_provider.run_opencode_turn(
+                "hello prompt", "anthropic/claude-sonnet-4-5", "ses_prev", "Be brief", persist=True
+            )
+        self.assertEqual(answer, "Hello world")
+        self.assertEqual(session_id, "ses_abc123")
+        self.assertEqual(usage, {"input_tokens": 10, "output_tokens": 5, "thinking_tokens": 1, "cache_read_tokens": 2})
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[:4], ["opencode", "run", "--format", "json"])
+        self.assertIn("--model", cmd)
+        self.assertIn("--session", cmd)
+        self.assertEqual(cmd[-2], "--")
+        self.assertIn("System instructions:\nBe brief", cmd[-1])
+        self.assertIn("User request:\nhello prompt", cmd[-1])
+
+    def test_delete_opencode_session_calls_cli_and_cleans_store(self):
+        completed = type("Completed", (), {"returncode": 0})()
+        with patch.object(opencode_provider.subprocess, "run", return_value=completed) as run, \
+                patch.object(opencode_provider._SESSION_STORE, "has_session", return_value=True), \
+                patch.object(opencode_provider._SESSION_STORE, "remove_session") as remove_session:
+            result = opencode_provider.delete_opencode_session("ses_abc123")
+        self.assertTrue(result["deleted"])
+        run.assert_called_once()
+        self.assertEqual(run.call_args[0][0], ["opencode", "session", "delete", "ses_abc123"])
+        remove_session.assert_called_once_with("ses_abc123")
 
 
 if __name__ == "__main__":

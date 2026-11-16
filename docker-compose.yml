@@ -16,6 +16,7 @@ services:
       GATEWAY_API_KEY: ${GATEWAY_API_KEY:?set GATEWAY_API_KEY}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-}
       AGY_DEFAULT_MODEL: ${AGY_DEFAULT_MODEL:-}
+      OPENCODE_DEFAULT_MODEL: ${OPENCODE_DEFAULT_MODEL:-}
       JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-120}
       CHAT_WAIT_SECONDS: ${CHAT_WAIT_SECONDS:-90}
       JOB_TTL_SECONDS: ${JOB_TTL_SECONDS:-3600}
@@ -33,9 +34,12 @@ services:
       JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-120}
       MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-1}
       JOB_TTL_SECONDS: ${JOB_TTL_SECONDS:-3600}
+      ENABLED_PROVIDERS: ${ENABLED_PROVIDERS:-codex,agy,opencode}
     volumes:
       - codex_auth:/home/node/.codex
       - agy_auth:/home/node/.gemini
+      - opencode_auth:/home/node/.local/share/opencode
+      - opencode_config:/home/node/.config/opencode
     depends_on:
       redis: {condition: service_healthy}
     networks: [gateway-internal]
@@ -60,3 +64,7 @@ volumes:
     name: codex-gateway_codex_auth
   agy_auth:
     name: ai-cli-gateway_agy_auth
+  opencode_auth:
+    name: ai-cli-gateway_opencode_auth
+  opencode_config:
+    name: ai-cli-gateway_opencode_config
