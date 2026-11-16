@@ -17,8 +17,14 @@ OPENCODE_BLOCKED_ENV = frozenset({
 })
 
 
-def opencode_environment() -> dict[str, str]:
-    return BaseCLIProvider.sanitize_env(extra_blocked=OPENCODE_BLOCKED_ENV)
+OPENCODE_CHAT_CONFIG = json.dumps({
+    "permission": {"*": "deny"},
+})
+
+
+def opencode_environment(mode: str = "chat") -> dict[str, str]:
+    overrides = {"OPENCODE_CONFIG_CONTENT": OPENCODE_CHAT_CONFIG} if mode == "chat" else None
+    return BaseCLIProvider.sanitize_env(extra_blocked=OPENCODE_BLOCKED_ENV, overrides=overrides)
 
 
 def opencode_data_home() -> str:
@@ -148,6 +154,7 @@ def run_opencode_turn(
     session_id: str | None = None,
     system_prompt: str | None = None,
     persist: bool = False,
+    mode: str = "chat",
     timeout: int = 120,
 ) -> tuple[str, str | None, dict[str, Any]]:
     formatted_prompt = prompt
@@ -157,6 +164,8 @@ def run_opencode_turn(
     with tempfile.TemporaryDirectory(prefix="opencode-job-") as workdir:
         resolved_model = resolve_opencode_model(model)
         command = ["opencode", "run", "--format", "json"]
+        if mode == "chat":
+            command.append("--pure")
         if resolved_model:
             command.extend(["--model", resolved_model])
         if session_id:
@@ -171,7 +180,7 @@ def run_opencode_turn(
             text=True,
             timeout=timeout + 30,
             check=False,
-            env=opencode_environment(),
+            env=opencode_environment(mode),
         )
 
     answer, detected_session_id, usage, error_type = _extract_opencode_output(process.stdout or "")
@@ -208,7 +217,7 @@ class OpenCodeProvider(BaseCLIProvider):
     name = "opencode"
     display_name = "OpenCode CLI"
     capabilities = ProviderCapabilities(
-        modes=("chat",),
+        modes=("chat", "agent"),
         default_mode="chat",
         supports_system_prompt=True,
         supports_sessions=True,
@@ -227,6 +236,7 @@ class OpenCodeProvider(BaseCLIProvider):
             req.session_id,
             req.system_prompt,
             persist=persist,
+            mode=req.mode,
             timeout=timeout,
         )
         if returned_session_id and persist:

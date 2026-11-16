@@ -62,6 +62,10 @@ function formatModeLabel(providerId, mode) {
     if (mode === 'chat') return 'Chat · slash & skill expansion off';
     if (mode === 'agent') return 'Normal · full CLI behavior';
   }
+  if (providerId === 'opencode') {
+    if (mode === 'chat') return 'Chat · tools & skills off';
+    if (mode === 'agent') return 'Normal · full CLI behavior';
+  }
   if (mode === 'chat') return 'Chat · lightweight';
   if (mode === 'agent') return 'Agent · full config';
   return mode;

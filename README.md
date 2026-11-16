@@ -31,6 +31,8 @@ docker compose exec worker codex login --device-auth
 docker compose exec worker codex login status
 # Sign in to Antigravity with your Google account (see the steps below)
 docker compose exec -it worker agy acp --login
+# Sign in to OpenCode (select OpenCode Go, OpenCode Zen, or another provider)
+docker compose exec -it worker opencode auth login
 # Check API:
 curl http://127.0.0.1:8088/health
 # Call from host (use the actual key from .env):
@@ -84,6 +86,50 @@ The sign-in state survives `docker compose down` and worker rebuilds because the
 For an older `.env`, remove any `GEMINI_API_KEY`, `AGY_ADC_AUTH`, `GOOGLE_CLOUD_PROJECT`, or `GOOGLE_CLOUD_LOCATION` entries. Current Compose no longer forwards these values, and worker startup removes a stale `modelProvider: gemini` setting from the agy CLI profile.
 
 The headless integration uses Antigravity's documented JSON stream input/output mode so prompts go over stdin rather than process arguments; model discovery runs `agy models`. The worker pins Antigravity tool permission to `request-review`; headless requests cannot accept interactive approvals, so approval-gated tool actions may be denied. Docker may also block the Linux user namespaces required by Antigravity's OS sandbox. Treat this as a chat gateway, not an unattended file-changing agent. Saved `agy` conversation IDs are provided by Antigravity's headless CLI and persist under its home volume.
+
+### OpenCode (`opencode`) authentication
+
+The worker image installs `opencode-ai` globally. Credentials, SQLite sessions, and Gateway transcript history (`gateway_sessions.json`) persist in the Docker volumes `ai-cli-gateway_opencode_auth` (`/home/node/.local/share/opencode`) and `ai-cli-gateway_opencode_config` (`/home/node/.config/opencode`).
+
+#### First-time setup (PowerShell)
+
+1. Rebuild and start the worker:
+
+   ```powershell
+   docker compose up -d --build worker
+   ```
+
+2. Run interactive provider authentication inside `worker`:
+
+   ```powershell
+   docker compose exec -it worker opencode auth login
+   ```
+
+   - Select **OpenCode Go** if you have an OpenCode Go subscription (models use the `opencode-go/...` prefix).
+   - Select **OpenCode** (Zen) for pay-as-you-go / free-tier models (`opencode/...`), or choose another supported provider and paste your API key.
+
+3. Verify the available models and test a turn:
+
+   ```powershell
+   docker compose exec worker opencode models --refresh
+   docker compose exec worker opencode run --format json "Reply OK"
+   ```
+
+4. *(Optional)* Restrict the model dropdown to **OpenCode Go** only and set a default model in `.env`:
+
+   ```env
+   OPENCODE_MODEL_FILTER=go
+   OPENCODE_DEFAULT_MODEL=deepseek-v4.1-flash
+   ```
+
+   Apply changes and clear the 5-minute Redis model catalog cache:
+
+   ```powershell
+   docker compose up -d --build worker api
+   docker compose exec redis redis-cli DEL gateway:provider:opencode:models
+   ```
+
+In **Chat** mode (`gateway_options.mode: "chat"`), the worker runs `opencode run --pure` with `OPENCODE_CONFIG_CONTENT={"permission":{"*":"deny"}}` so external plugins, tools, and skills are disabled. In **Normal** mode (`"agent"`), OpenCode runs with its standard plugins, tools, and skills enabled.
 
 ### Debugging incoming request JSON
 
@@ -163,6 +209,9 @@ curl -sS http://127.0.0.1:8088/v1/jobs \
 | GATEWAY_API_KEY | Required API/UI bearer secret | none |
 | DEFAULT_MODEL | Optional exact Codex-supported model name; blank lets CLI select default | blank |
 | AGY_DEFAULT_MODEL | Optional exact `agy` model slug; blank lets CLI select default | blank |
+| OPENCODE_DEFAULT_MODEL | Optional OpenCode model (`<provider>/<model>`, or model name when `OPENCODE_MODEL_FILTER` has one provider) | blank |
+| OPENCODE_MODEL_FILTER | Filter OpenCode models: `all`, `go` (`opencode-go/`), `zen` (`opencode/`), or comma-separated prefixes | blank (`all`) |
+| ENABLED_PROVIDERS | Comma-separated active providers on this worker (supports Mode A / Mode B) | `codex,agy,opencode` |
 | MAX_CONCURRENT_JOBS | Worker threads, capped at 4 | 1 |
 | JOB_TIMEOUT_SECONDS | Per CLI invocation, capped at 900 | 120 |
 | CHAT_WAIT_SECONDS | HTTP chat polling timeout, capped at 300 | 90 |
@@ -186,6 +235,8 @@ docker compose exec worker codex --version
 docker compose exec worker codex login status
 docker compose exec worker agy --version
 docker compose exec worker agy models
+docker compose exec worker opencode --version
+docker compose exec worker opencode models
 ```
 
 If the worker reports authentication, model access or usage-limit errors, verify the actual sign-in/plan. If the Codex CLI flags differ in a future version, check `codex exec --help` and adapt `worker/main.py`.

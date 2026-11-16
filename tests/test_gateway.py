@@ -284,12 +284,21 @@ class OpenCodeWorkerTests(unittest.TestCase):
         self.assertEqual(session_id, "ses_abc123")
         self.assertEqual(usage, {"input_tokens": 10, "output_tokens": 5, "thinking_tokens": 1, "cache_read_tokens": 2})
         cmd = run.call_args[0][0]
-        self.assertEqual(cmd[:4], ["opencode", "run", "--format", "json"])
+        try_kwargs = run.call_args[1]
+        self.assertEqual(cmd[:5], ["opencode", "run", "--format", "json", "--pure"])
+        self.assertIn("OPENCODE_CONFIG_CONTENT", try_kwargs["env"])
         self.assertIn("--model", cmd)
         self.assertIn("--session", cmd)
         self.assertEqual(cmd[-2], "--")
         self.assertIn("System instructions:\nBe brief", cmd[-1])
         self.assertIn("User request:\nhello prompt", cmd[-1])
+
+        with patch.object(opencode_provider.subprocess, "run", return_value=completed) as run_agent, \
+                patch.object(opencode_provider.tempfile, "TemporaryDirectory", workspace_temporary_directory):
+            opencode_provider.run_opencode_turn("hello prompt", None, mode="agent")
+        agent_cmd = run_agent.call_args[0][0]
+        self.assertNotIn("--pure", agent_cmd)
+        self.assertNotIn("OPENCODE_CONFIG_CONTENT", run_agent.call_args[1]["env"])
 
     def test_delete_opencode_session_calls_cli_and_cleans_store(self):
         completed = type("Completed", (), {"returncode": 0})()
