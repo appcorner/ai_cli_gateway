@@ -14,6 +14,8 @@ import {
   MessageCircle,
   Copy,
   Check,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from 'lucide-react';
 import './style.css';
 
@@ -76,6 +78,13 @@ function App() {
   const [token, setToken] = useState(sessionStorage.getItem('gatewayToken') || '');
   const [draft, setDraft] = useState('');
   const [activeTab, setActiveTab] = useState(tabFromHash);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem('codexGateway.sidebarCollapsed') === '1';
+    } catch {
+      return false;
+    }
+  });
 
   const [overview, setOverview] = useState(null);
   const [codexUsage, setCodexUsage] = useState(null);
@@ -477,6 +486,18 @@ function App() {
     }
   };
 
+  const toggleSidebar = () => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('codexGateway.sidebarCollapsed', next ? '1' : '0');
+      } catch {
+        // Ignore storage failures.
+      }
+      return next;
+    });
+  };
+
   if (!token) {
     return (
       <main className="login">
@@ -543,12 +564,29 @@ function App() {
   }[activeTab];
 
   return (
-    <div className="layout">
+    <div className={`layout ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <aside>
-        <div className="brand">
-          <Terminal size={24} /> AI CLI Gateway
+        <div className="aside-head">
+          <div className="brand" title="AI CLI Gateway">
+            <Terminal size={24} />
+            {!sidebarCollapsed && <span>AI CLI Gateway</span>}
+          </div>
+          <button
+            type="button"
+            className="sidebar-toggle"
+            onClick={toggleSidebar}
+            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-expanded={!sidebarCollapsed}
+          >
+            {sidebarCollapsed ? (
+              <PanelLeftOpen size={17} />
+            ) : (
+              <PanelLeftClose size={17} />
+            )}
+          </button>
         </div>
-        <p className="aside-sub">Personal AI CLI Router</p>
+        {!sidebarCollapsed && <p className="aside-sub">Personal AI CLI Router</p>}
         <nav aria-label="Main navigation">
           {TABS.map(({ id, label, icon: Icon }) => {
             const badge =
@@ -563,17 +601,28 @@ function App() {
                 type="button"
                 className={`nav-item ${activeTab === id ? 'active' : ''}`}
                 onClick={() => navigate(id)}
+                title={sidebarCollapsed ? label : undefined}
+                aria-label={label}
               >
                 <Icon size={17} />
-                <span>{label}</span>
-                {badge != null && <span className="nav-badge">{badge}</span>}
+                {!sidebarCollapsed && <span>{label}</span>}
+                {badge != null && (
+                  <span className="nav-badge">{badge}</span>
+                )}
               </button>
             );
           })}
         </nav>
         <div className="aside-foot">
-          <button type="button" className="ghost" onClick={logout}>
-            <LogOut size={16} /> Lock Console
+          <button
+            type="button"
+            className="ghost"
+            onClick={logout}
+            title={sidebarCollapsed ? 'Lock Console' : undefined}
+            aria-label="Lock Console"
+          >
+            <LogOut size={16} />
+            {!sidebarCollapsed && <span>Lock Console</span>}
           </button>
         </div>
       </aside>
