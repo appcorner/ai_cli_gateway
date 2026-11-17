@@ -26,9 +26,9 @@ const UI_BUILD_TIME =
 
 const DEFAULT_PROVIDERS = [
   {
-    id: 'codex',
-    display_name: 'Codex CLI',
-    default_model_alias: 'codex-default',
+    id: 'openai',
+    display_name: 'OpenAI (Codex CLI)',
+    default_model_alias: 'openai-default',
     capabilities: {
       modes: ['chat', 'agent'],
       default_mode: 'chat',
@@ -153,8 +153,8 @@ function App() {
   const [historyLoading, setHistoryLoading] = useState(false);
 
   const [modelCatalog, setModelCatalog] = useState([]);
-  const [provider, setProvider] = useState('codex');
-  const [selectedModel, setSelectedModel] = useState('codex-default');
+  const [provider, setProvider] = useState('openai');
+  const [selectedModel, setSelectedModel] = useState('openai-default');
   const [modeByProvider, setModeByProvider] = useState({});
   const [lastUsage, setLastUsage] = useState(null);
 
@@ -501,7 +501,7 @@ function App() {
   };
 
   const deleteSession = async (session) => {
-    const label = getProviderLabel(session.provider || 'codex');
+    const label = getProviderLabel(session.provider || 'openai');
     if (
       !window.confirm(
         `ลบ session ${label} นี้พร้อมประวัติข้อความถาวรใช่ไหมคะ?`
@@ -512,7 +512,7 @@ function App() {
     try {
       const { id } = session;
       await request(
-        `/admin/sessions/${encodeURIComponent(id)}?mode=${session.mode || 'agent'}&provider=${session.provider || 'codex'}`,
+        `/admin/sessions/${encodeURIComponent(id)}?mode=${session.mode || 'agent'}&provider=${session.provider || 'openai'}`,
         { method: 'DELETE' }
       );
       if (sessionId === id) {
@@ -527,7 +527,7 @@ function App() {
   };
 
   const continueSession = async (session) => {
-    const { id, provider: sessionProvider = 'codex' } = session;
+    const { id, provider: sessionProvider = 'openai' } = session;
     const targetDescriptor = providerMap[sessionProvider];
     const mode =
       session.mode ||
@@ -624,7 +624,7 @@ function App() {
   const hasSelectedInCatalog = modelCatalog.some((m) => m.id === selectedModel);
 
   const filteredSessions = sessions.filter((s) => {
-    const itemProvider = s.provider || 'codex';
+    const itemProvider = s.provider || 'openai';
     if (sessionFilter !== 'all' && itemProvider !== sessionFilter) return false;
     const q = sessionQuery.trim().toLowerCase();
     if (!q) return true;
@@ -1232,11 +1232,11 @@ function App() {
                     ...Array.from(
                       new Set([
                         ...providers.map((p) => p.id),
-                        ...sessions.map((s) => s.provider || 'codex'),
+                        ...sessions.map((s) => s.provider || 'openai'),
                       ])
                     ).map((pid) => ({
                       id: pid,
-                      label: `${getProviderLabel(pid)} (${sessions.filter((s) => (s.provider || 'codex') === pid).length})`,
+                      label: `${getProviderLabel(pid)} (${sessions.filter((s) => (s.provider || 'openai') === pid).length})`,
                     })),
                   ].map((item) => (
                     <button
@@ -1273,10 +1273,10 @@ function App() {
                   <tbody>
                     {filteredSessions.map((s) => (
                       <tr
-                        key={`${s.provider || 'codex'}:${s.mode || ''}:${s.id}`}
+                        key={`${s.provider || 'openai'}:${s.mode || ''}:${s.id}`}
                       >
                         <td>
-                          {getProviderLabel(s.provider || 'codex')}
+                          {getProviderLabel(s.provider || 'openai')}
                           {s.mode ? ` · ${s.mode}` : ''}
                         </td>
                         <td title={s.id}>
@@ -1346,7 +1346,7 @@ function App() {
                         <td title={j.id}>
                           <code>{j.id.slice(0, 8)}</code>
                         </td>
-                        <td>{getProviderLabel(j.provider || 'codex')}</td>
+                        <td>{getProviderLabel(j.provider || 'openai')}</td>
                         <td>{j.model || 'default'}</td>
                         <td>
                           <span className={`status ${j.status}`}>

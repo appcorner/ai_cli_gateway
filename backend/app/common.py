@@ -106,7 +106,10 @@ def fetch(job_id: str):
 
 
 def public_job(job):
-    return job
+    result = dict(job)
+    if result.get("provider") == "codex":
+        result["provider"] = "openai"
+    return result
 
 
 def control_request(provider: str, operation: str, session_id: str | None = None,

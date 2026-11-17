@@ -77,7 +77,7 @@ class GatewayOptions(BaseModel):
 
 class ChatRequest(BaseModel):
     provider: str | None = None
-    model: str = "codex-default"
+    model: str = "openai-default"
     messages: list[Message] = Field(min_length=1, max_length=50)
     stream: bool = False
     session_id: str | None = None
@@ -88,7 +88,7 @@ class ChatRequest(BaseModel):
 class JobRequest(BaseModel):
     provider: str | None = None
     prompt: str = Field(min_length=1, max_length=60000)
-    model: str = "codex-default"
+    model: str = "openai-default"
     session_id: str | None = None
     store_session: bool = False
     system_prompt: str | None = Field(default=None, max_length=20000)
@@ -101,8 +101,18 @@ def _configured_default_model(provider: str) -> str | None:
         return AGY_MODEL_DEFAULT or None
     return os.getenv(f"{provider.upper()}_DEFAULT_MODEL", "") or None
 
+def _internal_provider_id(provider: str, registered: dict[str, dict] | None = None) -> str:
+    providers = registered if registered is not None else get_registered_providers()
+    if provider == "openai" and "codex" in providers:
+        return "codex"
+    return provider
+
+def _public_provider_id(provider: str) -> str:
+    return "openai" if provider == "codex" else provider
+
 def validate_provider(provider: str, registered: dict[str, dict] | None = None) -> str:
     providers = registered if registered is not None else get_registered_providers()
+    provider = _internal_provider_id(provider, providers)
     if provider not in providers:
         raise HTTPException(400, f"Unknown or disabled provider: {provider}")
     return provider
@@ -110,11 +120,15 @@ def validate_provider(provider: str, registered: dict[str, dict] | None = None) 
 def resolve_provider(model: str, provider: str | None = None):
     registered = get_registered_providers()
     prefix = model.split(":", 1)[0] if ":" in model else None
-    has_known_prefix = prefix is not None and prefix in registered
+    has_known_prefix = prefix is not None and (
+        prefix in registered or (prefix == "openai" and "codex" in registered)
+    )
     if has_known_prefix:
-        inferred = prefix
-    elif model.endswith("-default") and model[:-8] in registered:
-        inferred = model[:-8]
+        inferred = validate_provider(prefix, registered)
+    elif model.endswith("-default") and (
+        model[:-8] in registered or (model[:-8] == "openai" and "codex" in registered)
+    ):
+        inferred = validate_provider(model[:-8], registered)
     else:
         inferred = "codex" if "codex" in registered else next(iter(registered))
     if provider:
@@ -127,9 +141,9 @@ def resolve_provider(model: str, provider: str | None = None):
 def resolve_model_request(model: str, provider: str | None = None):
     """Resolve the provider from a qualified model ID and return a CLI model ID."""
     provider = resolve_provider(model, provider)
-    if ":" in model and model.split(":", 1)[0] == provider:
+    if ":" in model and validate_provider(model.split(":", 1)[0]) == provider:
         model = model.split(":", 1)[1]
-    if model in (f"{provider}-default", "default", "codex-default"):
+    if model in (f"{_public_provider_id(provider)}-default", f"{provider}-default", "default", "codex-default", "openai-default"):
         return provider, _configured_default_model(provider)
     try:
         if any(item["id"] == model for item in get_model_catalog(provider)):
@@ -168,9 +182,9 @@ def list_providers():
     registered = get_registered_providers()
     data = [
         {
-            "id": name,
-            "display_name": item.get("display_name", name.title()),
-            "default_model_alias": f"{name}-default",
+            "id": _public_provider_id(name),
+            "display_name": "OpenAI (Codex CLI)" if name == "codex" else item.get("display_name", name.title()),
+            "default_model_alias": f"{_public_provider_id(name)}-default",
             "capabilities": item.get("capabilities", {}),
         }
         for name, item in registered.items()
@@ -187,11 +201,12 @@ def models(provider: str | None = None):
             catalog = get_model_catalog(item_provider)
         except Exception as exc:
             raise HTTPException(503, f"Could not load {item_provider} model catalog: {type(exc).__name__}") from exc
-        default_id = f"{item_provider}-default"
-        data.append({"id": default_id, "object": "model", "owned_by": f"local-{item_provider}",
-                     "name": f"{item_provider.title()} default",
+        public_provider = _public_provider_id(item_provider)
+        default_id = f"{public_provider}-default"
+        data.append({"id": default_id, "object": "model", "owned_by": f"local-{public_provider}",
+                     "name": f"{public_provider.title()} default",
                      "description": f"Gateway alias for the configured {item_provider} default model"})
-        data.extend({"id": f"{item_provider}:{item['id']}", "object": "model", "owned_by": item_provider,
+        data.extend({"id": f"{public_provider}:{item['id']}", "object": "model", "owned_by": public_provider,
                      "name": item.get("name", item["id"]), "is_default": item.get("is_default", False)}
                     for item in catalog)
     return {"object": "list", "data": data}
@@ -205,7 +220,7 @@ def submit(req: JobRequest):
 
 @app.get("/v1/jobs/{job_id}", dependencies=[Depends(auth)])
 def job_status(job_id: str):
-    return fetch(job_id)
+    return public_job(fetch(job_id))
 
 @app.post("/v1/chat/completions", dependencies=[Depends(auth)])
 async def chat(req: ChatRequest):
@@ -247,7 +262,7 @@ async def chat(req: ChatRequest):
         j = await asyncio.to_thread(fetch, job_id)
         if j["status"] == "completed":
             return {"id": "chatcmpl-" + job_id, "object": "chat.completion", "created": int(time.time()),
-                    "model": req.model, "provider": provider, "session_id": j.get("session_id"),
+                    "model": req.model, "provider": _public_provider_id(provider), "session_id": j.get("session_id"),
                     "usage": j.get("usage"),
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": j["result"]}, "finish_reason": "stop"}]}
         if j["status"] in ("failed", "cancelled"):
@@ -270,17 +285,17 @@ def overview():
     registered = get_registered_providers()
     queue_depth = sum(redis_client.llen(f"gateway:jobs:{name}") for name in registered)
     return {"counts": counts, "jobs": [public_job(j) for j in jobs[:20]],
-            "queue_depth": queue_depth, "model": "codex-default",
+            "queue_depth": queue_depth, "model": "openai-default",
             "job_ttl_seconds": JOB_TTL_SECONDS,
             "gateway_version": app.version}
 
 @app.get("/admin/jobs/{job_id}", dependencies=[Depends(auth)])
 def admin_job(job_id: str):
-    return {**fetch(job_id), "events": []}
+    return {**public_job(fetch(job_id)), "events": []}
 
 @app.get("/admin/usage", dependencies=[Depends(auth)])
-def usage(provider: str = "codex"):
-    validate_provider(provider)
+def usage(provider: str = "openai"):
+    provider = validate_provider(provider)
     cache_key = f"gateway:provider:{provider}:usage"
     cached = redis_client.get(cache_key)
     if cached:
@@ -319,12 +334,12 @@ def admin_sessions():
                 for list_mode in list_modes:
                     items = session_control("list", mode=list_mode, provider=name)
                     for item in items:
-                        item.setdefault("provider", name)
+                        item["provider"] = _public_provider_id(item.get("provider") or name)
                     sessions.extend(items)
             else:
                 items = session_control("list", provider=name)
                 for item in items:
-                    item.setdefault("provider", name)
+                    item["provider"] = _public_provider_id(item.get("provider") or name)
                 sessions.extend(items)
         return {"sessions": sessions}
     except Exception as exc:
@@ -332,8 +347,8 @@ def admin_sessions():
 
 @app.get("/admin/sessions/{session_id}", dependencies=[Depends(auth)])
 def admin_session_history(session_id: str, mode: Literal["chat", "agent"] = "agent",
-                          provider: str = "codex"):
-    validate_provider(provider)
+                          provider: str = "openai"):
+    provider = validate_provider(provider)
     try:
         return session_control("history", session_id, mode, provider=provider)
     except Exception as exc:
@@ -341,8 +356,8 @@ def admin_session_history(session_id: str, mode: Literal["chat", "agent"] = "age
 
 @app.delete("/admin/sessions/{session_id}", dependencies=[Depends(auth)])
 def delete_admin_session(session_id: str, mode: Literal["chat", "agent"] = "agent",
-                         provider: str = "codex"):
-    validate_provider(provider)
+                         provider: str = "openai"):
+    provider = validate_provider(provider)
     try:
         session_control("delete", session_id, mode, provider=provider)
         return {"id": session_id, "deleted": True}

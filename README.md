@@ -45,7 +45,7 @@ curl http://127.0.0.1:8088/health
 curl -sS http://127.0.0.1:8088/v1/chat/completions \
   -H "Authorization: Bearer YOUR_GATEWAY_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"codex-default","messages":[{"role":"user","content":"Hello in Thai"}],"stream":false}'
+  -d '{"model":"openai-default","messages":[{"role":"user","content":"Hello in Thai"}],"stream":false}'
 ```
 
 If `--device-auth` isn't allowed by the account, consult official Codex CLI sign-in instructions for your installation; do not paste or publish session tokens. `codex login` is another supported interactive sign-in route when a browser callback is available.
@@ -166,7 +166,7 @@ networks:
 2. In n8n use an **HTTP Request** node:
    - POST `http://api:8000/v1/chat/completions` (the `api` name is resolvable on the shared network)
    - Header `Authorization: Bearer YOUR_GATEWAY_API_KEY` (use n8n credentials rather than hardcoding secret)
-   - JSON body `{"model":"codex-default","messages":[{"role":"user","content":"Hi"}],"stream":false}`
+   - JSON body `{"model":"openai-default","messages":[{"role":"user","content":"Hi"}],"stream":false}`
    - Request timeout greater than `CHAT_WAIT_SECONDS`, e.g. 130000 ms.
 3. Optionally import `examples/n8n-workflow.json`. **Important:** this sample references `$env.GATEWAY_API_KEY`; your n8n installation must supply it and allow env access in expressions. Many n8n installations restrict `$env`. Replace the sample Authorization header with n8n Header Auth credentials when necessary. The sample assumes Docker network connectivity to hostname `api`.
 4. If n8n uses its **AI Agent / OpenAI Chat Model** node, compatibility is not guaranteed; start with HTTP Request first.
@@ -174,7 +174,7 @@ networks:
 ## API
 
 - `GET /health` — dependency status, not authenticated (only localhost-published)
-- `GET /v1/models` — both providers' default aliases and model catalogs (cached in Redis for five minutes). Model IDs are provider-qualified as `codex:<model-id>` or `agy:<model-id>` so clients can select a model without a separate provider field. Optional `?provider=codex|agy` filters the list.
+- `GET /v1/models` — provider default aliases and model catalogs (cached in Redis for five minutes). Model IDs are provider-qualified as `openai:<model-id>` or `agy:<model-id>` so clients can select a model without a separate provider field. Optional `?provider=openai|agy` filters the list. Legacy `codex:` model IDs remain accepted.
 - `POST /v1/chat/completions` — synchronous, returns OpenAI-like subset
 - `POST /v1/jobs` — enqueue asynchronous task
 - `GET /v1/jobs/{id}` — job status/result
@@ -183,7 +183,7 @@ networks:
 - `GET /admin/sessions`, `GET /admin/sessions/{session_id}`, and `DELETE /admin/sessions/{session_id}` — list and continue Codex or Antigravity sessions; Codex sessions can also be deleted
 
 Every route except `/health` requires the shared bearer key.
-Model discovery runs through both authenticated CLIs. The list is a catalog, not a guarantee that the account can use every entry; the selected model is verified by the next request. Selecting an ID with the `agy:` prefix automatically routes a chat or job request to Antigravity; `codex:` routes to Codex. The legacy `agy-default` alias also selects Antigravity. If `provider` is supplied, it must match the model ID prefix. An unqualified model ID with no provider continues to default to Codex.
+Model discovery runs through the authenticated CLIs. The list is a catalog, not a guarantee that the account can use every entry; the selected model is verified by the next request. Selecting an ID with the `agy:` prefix automatically routes a chat or job request to Antigravity; `openai:` routes to the Codex CLI through the OpenAI-compatible gateway. The `openai-default` and `agy-default` aliases select their respective providers. If `provider` is supplied, it must match the model ID prefix. An unqualified model ID with no provider continues to route to the Codex CLI.
 `gateway_options.mode` selects `chat` (default) or `agent` for Codex, and `chat` (default) or `agent` (shown as Normal in the tester) for agy. Codex Chat mode uses a clean `CODEX_HOME`, disables user/project extensions, bundled Skills and web search, sets reasoning/verbosity low, and limits stateless request history. Agy Chat mode disables headless slash-command handling; core instructions and global/plugin rules can still add context. Agy Normal mode enables normal slash-command and skill behavior. The Chat Tester shows the provider-specific mode selector.
 
 To save a conversation, set `store_session: true` on its first `/v1/chat/completions` request. The response includes `session_id`; pass that ID on subsequent calls to continue the same Codex thread. Also pass the same `gateway_options.mode` on subsequent calls. If session history is not wanted, omit both fields and each request remains ephemeral.
@@ -204,7 +204,7 @@ Use the returned `session_id` on the next request:
 ```bash
 curl -sS http://127.0.0.1:8088/v1/jobs \
  -H 'Authorization: Bearer YOUR_GATEWAY_API_KEY' -H 'Content-Type: application/json' \
- -d '{"prompt":"Summarize REST API briefly in Thai","model":"codex-default"}'
+ -d '{"prompt":"Summarize REST API briefly in Thai","model":"openai-default"}'
 # Then GET /v1/jobs/<id> with the same Authorization header.
 ```
 
