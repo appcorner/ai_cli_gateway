@@ -93,7 +93,13 @@ def rpc_response(
             continue
         if message.get("id") == request_id:
             if "error" in message:
-                raise RuntimeError("Codex app-server returned an RPC error")
+                error = message.get("error") or {}
+                code = error.get("code") if isinstance(error, dict) else None
+                detail = error.get("message") if isinstance(error, dict) else str(error)
+                suffix = f" code={code}" if code is not None else ""
+                if detail:
+                    suffix += f": {str(detail)[:1000]}"
+                raise RuntimeError(f"Codex app-server returned an RPC error{suffix}")
             return message.get("result", {})
     raise TimeoutError("Codex app-server did not respond")
 
@@ -232,7 +238,14 @@ class CodexProvider(BaseCLIProvider):
                     result = f.read()[:100000]
             if p.returncode == 0 and result:
                 return ExecutionResult(text=result)
-            raise RuntimeError("Codex failed; check worker logs and sign-in status")
+            detail = (p.stderr or "").strip()
+            if detail:
+                detail = detail[-2000:]
+            else:
+                detail = "no stderr output"
+            raise RuntimeError(
+                f"Codex exec failed with exit code {p.returncode}: {detail}"
+            )
 
     def _run_session_turn(
         self,
@@ -320,8 +333,17 @@ class CodexProvider(BaseCLIProvider):
                 if method_name == "item/agentMessage/delta" and params.get("turnId") == turn_id:
                     answer.append(params.get("delta", ""))
                 elif method_name == "turn/completed" and params.get("turn", {}).get("id") == turn_id:
-                    if params.get("turn", {}).get("status") != "completed":
-                        raise RuntimeError("Codex turn did not complete")
+                    completed_turn = params.get("turn", {})
+                    if completed_turn.get("status") != "completed":
+                        error = completed_turn.get("error") or {}
+                        if isinstance(error, dict):
+                            detail = error.get("message") or error.get("code") or ""
+                        else:
+                            detail = str(error)
+                        suffix = f": {str(detail)[:1000]}" if detail else ""
+                        raise RuntimeError(
+                            f"Codex turn did not complete (status={completed_turn.get('status', 'unknown')}){suffix}"
+                        )
                     return "".join(answer).strip(), session_id
             raise TimeoutError("Codex session turn timed out")
         finally:

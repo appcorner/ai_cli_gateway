@@ -146,7 +146,7 @@ docker compose up -d --force-recreate api
 docker compose logs -f --tail 100 api
 ```
 
-This logs bodies for `POST /v1/chat/completions` and `POST /v1/jobs` to the API container log, including prompts and system prompts. Authorization headers are not logged. Turn it off again after debugging by setting `LOG_REQUEST_BODIES=false` and recreating `api`; remove old container logs if they contain sensitive prompts.
+This logs bodies for `POST /v1/chat/completions` and `POST /v1/jobs` to the API container log, including prompts and system prompts. Authorization headers are not logged. Provider execution failures and their error details are written separately to the worker log; prompt and answer text are not included in those failure logs. Turn request-body logging off after debugging by setting `LOG_REQUEST_BODIES=false` and recreating `api`; remove old container logs if they contain sensitive prompts.
 
 ## n8n integration
 

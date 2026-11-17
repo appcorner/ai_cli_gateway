@@ -86,8 +86,14 @@ def execute(job_id: str) -> None:
                 error = f"{provider_name} returned no answer"
         except subprocess.TimeoutExpired:
             error = f"{provider_name} exceeded {TIMEOUT}s timeout"
+            print(f"job={job_id} provider={provider_name} error={error}", flush=True)
         except Exception as exc:
             error = f"{provider_name} request failed: {type(exc).__name__}"
+            detail = " ".join(str(exc).split())[:2000] or "no error detail"
+            print(
+                f"job={job_id} provider={provider_name} error_type={type(exc).__name__} detail={detail}",
+                flush=True,
+            )
 
     duration_ms = int((time.monotonic() - start) * 1000)
     if redis.exists(key):
