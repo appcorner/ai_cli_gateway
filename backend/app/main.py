@@ -132,7 +132,7 @@ def resolve_provider(model: str, provider: str | None = None):
     else:
         inferred = "codex" if "codex" in registered else next(iter(registered))
     if provider:
-        validate_provider(provider, registered)
+        provider = validate_provider(provider, registered)
         if has_known_prefix and provider != inferred:
             raise HTTPException(400, "Model provider prefix does not match provider field")
         return provider
