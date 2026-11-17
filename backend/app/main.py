@@ -124,18 +124,23 @@ def resolve_provider(model: str, provider: str | None = None):
         return provider
     return validate_provider(inferred, registered)
 
-def normalized_model(model: str, provider: str | None = None):
+def resolve_model_request(model: str, provider: str | None = None):
+    """Resolve the provider from a qualified model ID and return a CLI model ID."""
     provider = resolve_provider(model, provider)
     if ":" in model and model.split(":", 1)[0] == provider:
         model = model.split(":", 1)[1]
     if model in (f"{provider}-default", "default", "codex-default"):
-        return _configured_default_model(provider)
+        return provider, _configured_default_model(provider)
     try:
         if any(item["id"] == model for item in get_model_catalog(provider)):
-            return model
+            return provider, model
     except Exception as exc:
         raise HTTPException(503, f"{provider} model catalog unavailable: {type(exc).__name__}") from exc
     raise HTTPException(400, "Model must be a gateway model ID returned by /v1/models")
+
+def normalized_model(model: str, provider: str | None = None):
+    """Return the provider-specific model ID that should be sent to a CLI."""
+    return resolve_model_request(model, provider)[1]
 
 def _default_mode_for(provider: str, session_id: str | None, registered: dict[str, dict] | None = None) -> str:
     providers = registered if registered is not None else get_registered_providers()
@@ -193,9 +198,9 @@ def models(provider: str | None = None):
 
 @app.post("/v1/jobs", dependencies=[Depends(auth)], status_code=202)
 def submit(req: JobRequest):
-    provider = resolve_provider(req.model, req.provider)
+    provider, model = resolve_model_request(req.model, req.provider)
     mode = req.gateway_options.mode if req.gateway_options else _default_mode_for(provider, req.session_id)
-    return {"id": enqueue(req.prompt, normalized_model(req.model, provider), req.session_id,
+    return {"id": enqueue(req.prompt, model, req.session_id,
                            req.store_session, req.system_prompt, mode, provider), "status": "queued"}
 
 @app.get("/v1/jobs/{job_id}", dependencies=[Depends(auth)])
@@ -204,7 +209,7 @@ def job_status(job_id: str):
 
 @app.post("/v1/chat/completions", dependencies=[Depends(auth)])
 async def chat(req: ChatRequest):
-    provider = resolve_provider(req.model, req.provider)
+    provider, model = resolve_model_request(req.model, req.provider)
     mode = req.gateway_options.mode if req.gateway_options else _default_mode_for(provider, req.session_id)
     max_history_messages = req.gateway_options.max_history_messages if req.gateway_options else 10
     if req.stream:
@@ -235,7 +240,7 @@ async def chat(req: ChatRequest):
             prompt += "\nReply to the most recent user turn."
     if len(prompt) > 60000:
         raise HTTPException(413, "Conversation too long")
-    job_id = await asyncio.to_thread(enqueue, prompt, normalized_model(req.model, provider), req.session_id,
+    job_id = await asyncio.to_thread(enqueue, prompt, model, req.session_id,
                                      req.store_session, system_prompt, mode, provider)
     deadline = time.monotonic() + WAIT_SECONDS
     while time.monotonic() < deadline:
