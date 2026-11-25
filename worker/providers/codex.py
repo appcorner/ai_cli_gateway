@@ -11,12 +11,22 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from .base import BaseCLIProvider, ExecutionRequest, ExecutionResult, ProviderCapabilities
+from .base import (
+    BaseCLIProvider,
+    ExecutionRequest,
+    ExecutionResult,
+    ProviderCapabilities,
+    agent_network_enabled,
+    resolve_workspace_dir,
+    workspace_context,
+)
+from .mcp_sync import sync_codex_mcp_config
 
 CODEX_HOME = os.environ.get("CODEX_HOME", "/home/node/.codex")
 CHAT_CODEX_HOME = os.path.join(CODEX_HOME, "chat-mode")
 CHAT_HOME_LOCK = threading.Lock()
 CODEX_BLOCKED_ENV = frozenset({"GEMINI_API_KEY", "ANTHROPIC_API_KEY"})
+CODEX_ALLOWED_SANDBOXES = frozenset({"read-only", "workspace-write", "danger-full-access"})
 
 CHAT_CONFIG = '''model_reasoning_effort = "low"
 model_verbosity = "low"
@@ -47,8 +57,13 @@ def chat_config_args() -> list[str]:
     return [part for value in values for part in ("-c", value)]
 
 
+def _codex_agent_sandbox() -> str:
+    raw = os.environ.get("CODEX_AGENT_SANDBOX", "workspace-write").strip()
+    return raw if raw in CODEX_ALLOWED_SANDBOXES else "workspace-write"
+
+
 def codex_environment(mode: str = "agent") -> dict[str, str]:
-    env = BaseCLIProvider.sanitize_env(extra_blocked=CODEX_BLOCKED_ENV)
+    env = BaseCLIProvider.sanitize_env(extra_blocked=CODEX_BLOCKED_ENV, mode=mode)
     if mode == "chat":
         with CHAT_HOME_LOCK:
             os.makedirs(CHAT_CODEX_HOME, mode=0o700, exist_ok=True)
@@ -122,6 +137,8 @@ def initialized_app_server(mode: str = "agent") -> tuple[subprocess.Popen, queue
     command = ["codex", "app-server", "--listen", "stdio://"]
     if mode == "chat":
         command.extend(chat_config_args())
+    elif agent_network_enabled():
+        command.extend(["-c", "sandbox_workspace_write.network_access=true"])
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -181,6 +198,9 @@ class CodexProvider(BaseCLIProvider):
         session_list_modes=("agent", "chat"),
     )
 
+    def startup_init(self) -> None:
+        sync_codex_mcp_config(CODEX_HOME)
+
     def execute_turn(self, req: ExecutionRequest) -> ExecutionResult:
         timeout = req.timeout_seconds or self.timeout
         if req.session_id or req.store_session or req.system_prompt:
@@ -204,15 +224,21 @@ class CodexProvider(BaseCLIProvider):
     def _run_ephemeral_exec(
         self, prompt: str, model: str | None, mode: str, timeout: int
     ) -> ExecutionResult:
-        with tempfile.TemporaryDirectory(prefix="codex-job-") as workdir:
-            outfile = os.path.join(workdir, "answer.txt")
+        with workspace_context("codex-job-", tempfile.TemporaryDirectory) as workdir, \
+                tempfile.TemporaryDirectory(prefix="codex-out-") as outdir:
+            outfile = os.path.join(outdir, "answer.txt")
+            sandbox = "read-only" if mode == "chat" else _codex_agent_sandbox()
             cmd = [
-                "codex", "exec", "--json", "--ephemeral", "--sandbox", "read-only",
+                "codex", "exec", "--json", "--ephemeral", "--sandbox", sandbox,
                 "--skip-git-repo-check", "--output-last-message", outfile,
             ]
             env = codex_environment(mode)
             if mode == "chat":
                 cmd.extend(["--ignore-user-config", *chat_config_args()])
+            else:
+                cmd.extend(["-c", 'approval_policy="never"'])
+                if agent_network_enabled():
+                    cmd.extend(["-c", "sandbox_workspace_write.network_access=true"])
             if model:
                 cmd.extend(["--model", model])
             cmd.append("-")
@@ -274,7 +300,9 @@ class CodexProvider(BaseCLIProvider):
         notifications: list[dict[str, Any]] = []
         try:
             process, incoming = initialized_app_server(mode)
-            safety: dict[str, Any] = {"cwd": "/work", "sandbox": "read-only", "approvalPolicy": "never"}
+            cwd = resolve_workspace_dir() or "/work"
+            sandbox = "read-only" if mode == "chat" else _codex_agent_sandbox()
+            safety: dict[str, Any] = {"cwd": cwd, "sandbox": sandbox, "approvalPolicy": "never"}
             if session_id:
                 if system_prompt:
                     safety["developerInstructions"] = system_prompt

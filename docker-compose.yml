@@ -21,6 +21,7 @@ services:
       CHAT_WAIT_SECONDS: ${CHAT_WAIT_SECONDS:-90}
       JOB_TTL_SECONDS: ${JOB_TTL_SECONDS:-3600}
       LOG_REQUEST_BODIES: ${LOG_REQUEST_BODIES:-false}
+      DEFAULT_TOOL_EXECUTION: ${DEFAULT_TOOL_EXECUTION:-auto}
     depends_on:
       redis: {condition: service_healthy}
     networks: [gateway-internal, gateway-public]
@@ -36,14 +37,28 @@ services:
       JOB_TTL_SECONDS: ${JOB_TTL_SECONDS:-3600}
       ENABLED_PROVIDERS: ${ENABLED_PROVIDERS:-codex,agy,opencode}
       OPENCODE_MODEL_FILTER: ${OPENCODE_MODEL_FILTER:-}
+      WORKER_TRACE: ${WORKER_TRACE:-false}
+      CLI_WORKSPACE_DIR: ${CLI_WORKSPACE_DIR:-/work}
+      AGENT_ALLOW_NETWORK: ${AGENT_ALLOW_NETWORK:-true}
+      AGY_TOOL_PERMISSION: ${AGY_TOOL_PERMISSION:-proceed-in-sandbox}
+      CODEX_AGENT_SANDBOX: ${CODEX_AGENT_SANDBOX:-workspace-write}
+      N8N_MCP_URL: ${N8N_MCP_URL:-}
+      N8N_MCP_BEARER_TOKEN: ${N8N_MCP_BEARER_TOKEN:-}
+      N8N_MCP_AUTH_HEADER: ${N8N_MCP_AUTH_HEADER:-}
+      N8N_WEBHOOK_BASE_URL: ${N8N_WEBHOOK_BASE_URL:-}
+      N8N_WEBHOOK_TOKEN: ${N8N_WEBHOOK_TOKEN:-}
+      N8N_WEBHOOK_AUTH_HEADER: ${N8N_WEBHOOK_AUTH_HEADER:-Authorization}
+      N8N_WEBHOOK_TOOLS_FILE: ${N8N_WEBHOOK_TOOLS_FILE:-}
+      N8N_WEBHOOK_TOOLS_JSON: ${N8N_WEBHOOK_TOOLS_JSON:-}
     volumes:
+      - cli_workspace:/work
       - codex_auth:/home/node/.codex
       - agy_auth:/home/node/.gemini
       - opencode_auth:/home/node/.local/share/opencode
       - opencode_config:/home/node/.config/opencode
     depends_on:
       redis: {condition: service_healthy}
-    networks: [gateway-internal]
+    networks: [gateway-internal, gateway-public]
     restart: unless-stopped
     init: true
     security_opt: ["no-new-privileges:true"]
@@ -61,6 +76,8 @@ networks:
   gateway-public:
     name: codex-gateway-public
 volumes:
+  cli_workspace:
+    name: ai-cli-gateway_cli_workspace
   codex_auth:
     name: codex-gateway_codex_auth
   agy_auth:

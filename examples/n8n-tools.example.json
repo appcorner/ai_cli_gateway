@@ -1,0 +1,57 @@
+{
+  "tools": [
+    {
+      "name": "search_long_term_memory",
+      "description": "Search long-term memory stored in n8n",
+      "method": "POST",
+      "url": "/webhook/search-long-term-memory",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "input": {
+            "type": "string",
+            "description": "Query string to search in memory"
+          }
+        },
+        "required": ["input"]
+      }
+    },
+    {
+      "name": "research",
+      "description": "Fetch or research a URL or topic via n8n webhook",
+      "method": "POST",
+      "url": "/webhook/research",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "URL or search query"
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "gen_image",
+      "description": "Generate an image via n8n webhook and save or return result",
+      "method": "POST",
+      "url": "/webhook/gen-image",
+      "timeout": 90,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "description": "Detailed image prompt including outfit and location"
+          },
+          "reference_path": {
+            "type": "string",
+            "description": "Optional path in shared /work directory"
+          }
+        },
+        "required": ["prompt"]
+      }
+    }
+  ]
+}

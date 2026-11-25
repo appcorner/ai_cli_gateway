@@ -137,30 +137,43 @@ The worker image installs `opencode-ai` globally. Credentials, SQLite sessions, 
 
 In **Chat** mode (`gateway_options.mode: "chat"`), the worker runs `opencode run --pure` with `OPENCODE_CONFIG_CONTENT={"permission":{"*":"deny"}}` so external plugins, tools, and skills are disabled. In **Normal** mode (`"agent"`), OpenCode runs with its standard plugins, tools, and skills enabled.
 
-### Debugging incoming request JSON
+### Debugging incoming request JSON and worker traces
 
-Request-body logging is disabled by default. To inspect JSON sent by n8n, set `LOG_REQUEST_BODIES=true` in `.env`, then recreate the API container:
+Request-body logging and verbose worker CLI tracing are disabled by default. To inspect JSON sent by n8n, set `LOG_REQUEST_BODIES=true` in `.env`, then recreate the API container:
 
 ```powershell
 docker compose up -d --force-recreate api
 docker compose logs -f --tail 100 api
 ```
 
-This logs bodies for `POST /v1/chat/completions` and `POST /v1/jobs` to the API container log, including prompts and system prompts. Authorization headers are not logged. Provider execution failures and their error details are written separately to the worker log; prompt and answer text are not included in those failure logs. Turn request-body logging off after debugging by setting `LOG_REQUEST_BODIES=false` and recreating `api`; remove old container logs if they contain sensitive prompts.
+To inspect full CLI stdout event lines, stderr output, and per-stage trace markers (`cli_start`, `stdout_line`, `stderr`, `cli_exit`) when debugging worker failures, set `WORKER_TRACE=true` in `.env` and recreate the worker container:
+
+```powershell
+docker compose up -d --force-recreate worker
+docker compose logs -f --tail 100 worker
+```
+
+Even with `WORKER_TRACE=false`, safe provider failure diagnostics (CLI return code, event summary tags, token usage, stderr tail), Python tracebacks in the worker log, and per-job diagnostic `events` via `GET /admin/jobs/{id}` are always recorded without including raw prompt or answer prose. Turn `LOG_REQUEST_BODIES=false` and `WORKER_TRACE=false` back off after debugging and recreate `api` / `worker`; remove old container logs if they contain sensitive prompts or outputs.
 
 ## n8n integration
 
-1. Join n8n container to the gateway public network, or attach its Compose service to it:
+1. Join n8n container to the gateway public network, and optionally mount the shared `ai-cli-gateway_cli_workspace` volume if n8n and the CLI worker share files (such as reference images or generated outputs):
 
 ```yaml
 services:
   n8n:
+    volumes:
+      - cli_workspace:/work
     networks:
       - default
       - codex-gateway-public
 networks:
   codex-gateway-public:
     external: true
+volumes:
+  cli_workspace:
+    external: true
+    name: ai-cli-gateway_cli_workspace
 ```
 
 2. In n8n use an **HTTP Request** node:
@@ -169,7 +182,16 @@ networks:
    - JSON body `{"model":"openai-default","messages":[{"role":"user","content":"Hi"}],"stream":false}`
    - Request timeout greater than `CHAT_WAIT_SECONDS`, e.g. 130000 ms.
 3. Optionally import `examples/n8n-workflow.json`. **Important:** this sample references `$env.GATEWAY_API_KEY`; your n8n installation must supply it and allow env access in expressions. Many n8n installations restrict `$env`. Replace the sample Authorization header with n8n Header Auth credentials when necessary. The sample assumes Docker network connectivity to hostname `api`.
-4. If n8n uses its **AI Agent / OpenAI Chat Model** node, compatibility is not guaranteed; start with HTTP Request first.
+4. **Shared CLI workspace & n8n tools (`agent` vs client-side `tools`)**:
+   - **Shared workspace (`/work`)**: `docker-compose.yml` mounts the `ai-cli-gateway_cli_workspace` Docker volume at `/work` (`CLI_WORKSPACE_DIR=/work`). All CLIs (`agy`, `codex`, `opencode`) use `/work` as their working directory in both `chat` and `agent` modes.
+   - **Worker-side n8n tools (`gateway_options.mode: "agent"`)**: Because `worker` is attached to `codex-gateway-public`, CLIs in `agent` mode can reach n8n over the Docker network in three ways (while `chat` mode remains sandboxed and strips `N8N_*` secrets):
+     - **Remote MCP Server (`N8N_MCP_URL`)**: Point `N8N_MCP_URL` to your n8n MCP Server Trigger endpoint (e.g. `http://n8n:5678/mcp/<id>`), optionally with `N8N_MCP_BEARER_TOKEN` or `N8N_MCP_AUTH_HEADER`. On worker startup, `mcp_sync.py` writes the server entry into `agy` (`serverUrl`), `codex` (`config.toml`), and `opencode` (`opencode.json`).
+     - **Built-in Webhook MCP Bridge (`N8N_WEBHOOK_TOOLS_FILE` / `N8N_WEBHOOK_TOOLS_JSON`)**: Copy `examples/n8n-tools.example.json` to `/work/n8n_tools.json`, set `N8N_WEBHOOK_BASE_URL=http://n8n:5678`, `N8N_WEBHOOK_TOOLS_FILE=/work/n8n_tools.json`, and optionally `N8N_WEBHOOK_TOKEN`. The worker registers `mcp_n8n_bridge.py` (`n8n_webhooks`) across all three CLIs automatically in `agent` mode.
+     - **Direct `curl` / scripts**: With `AGENT_ALLOW_NETWORK=true`, `agy --dangerously-skip-permissions`, `codex --sandbox workspace-write` (with `network_access=true`), and `opencode` in `agent` mode can run scripts or `curl http://n8n:5678/webhook/...` inside `/work`.
+   - **Client-side n8n AI Agent tools (`gateway_options.tool_execution`)**: When calling `POST /v1/chat/completions` with OpenAI `tools` (e.g. from an n8n AI Agent node), `gateway_options.tool_execution` (or `DEFAULT_TOOL_EXECUTION`) selects who executes tools:
+     - `auto` *(default)*: uses client-side OpenAI `tool_calls` (`finish_reason: "tool_calls"`) when `mode: "chat"`, and lets the CLI execute worker/MCP tools when `mode: "agent"`.
+     - `client`: always returns OpenAI `tool_calls` to the caller (even in `mode: "agent"`), and accepts subsequent `role: "assistant"` (`tool_calls`) + `role: "tool"` turns.
+     - `worker` / `off`: never translates OpenAI `tools` for client-side execution.
 
 ## API
 
@@ -222,6 +244,15 @@ curl -sS http://127.0.0.1:8088/v1/jobs \
 | JOB_TIMEOUT_SECONDS | Per CLI invocation, capped at 900 | 120 |
 | CHAT_WAIT_SECONDS | HTTP chat polling timeout, capped at 300 | 90 |
 | JOB_TTL_SECONDS | How long status and results remain in Redis memory | 3600 |
+| WORKER_TRACE | Print full CLI stdout event lines, stderr, and stage markers to worker logs | `false` |
+| CLI_WORKSPACE_DIR | Shared working directory for all CLIs (`agy`, `codex`, `opencode`) in both `chat` and `agent` modes | `/work` |
+| AGENT_ALLOW_NETWORK | Allow `agent` mode CLIs to access Docker/network endpoints (e.g. n8n webhooks) | `true` |
+| AGY_TOOL_PERMISSION | Default `toolPermission` written to `agy` `settings.json` on worker startup | `proceed-in-sandbox` |
+| CODEX_AGENT_SANDBOX | Codex `--sandbox` profile in `agent` mode (`read-only`, `workspace-write`, `danger-full-access`) | `workspace-write` |
+| N8N_MCP_URL | Optional remote n8n MCP server URL synced to all CLIs on startup | blank |
+| N8N_WEBHOOK_BASE_URL | Base URL for relative entries in `N8N_WEBHOOK_TOOLS_FILE` / `N8N_WEBHOOK_TOOLS_JSON` | blank |
+| N8N_WEBHOOK_TOOLS_FILE | Path to JSON file mapping n8n webhooks for the built-in `mcp_n8n_bridge.py` stdio MCP server | blank |
+| DEFAULT_TOOL_EXECUTION | Default strategy for OpenAI `tools` in `/v1/chat/completions`: `auto`, `client`, `worker`, `off` | `auto` |
 
 ### Data & security
 

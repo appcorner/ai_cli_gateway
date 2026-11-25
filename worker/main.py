@@ -4,7 +4,9 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timezone
+from typing import Any
 
 from redis import Redis
 
@@ -14,6 +16,7 @@ if _WORKER_DIR not in sys.path:
     sys.path.insert(0, _WORKER_DIR)
 
 from providers import ExecutionRequest, build_registry  # noqa: E402
+from providers.base import append_trace_event, worker_trace_enabled  # noqa: E402
 
 redis = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
 TIMEOUT = max(10, min(int(os.environ.get("JOB_TIMEOUT_SECONDS", "120")), 900))
@@ -59,22 +62,48 @@ def execute(job_id: str) -> None:
     session_id = job.get("session_id") or None
     store_session = job.get("store_session") == "1"
     mode = job.get("mode") or "chat"
+    model_name = job.get("model") or None
+    prompt_text = job["prompt"]
+    system_prompt_text = job.get("system_prompt") or None
     usage = None
     result = None
     error = None
     status = "failed"
+    trace_events: list[dict[str, Any]] = []
+
+    append_trace_event(
+        trace_events,
+        "claimed",
+        provider=provider_name,
+        model=model_name or "default",
+        mode=mode,
+        persist=store_session or bool(session_id),
+        prompt_chars=len(prompt_text),
+        system_prompt_chars=len(system_prompt_text or ""),
+    )
+    if worker_trace_enabled():
+        print(
+            f"trace job={job_id} provider={provider_name} stage=claimed "
+            f"model={model_name or 'default'} mode={mode} "
+            f"persist={store_session or bool(session_id)} "
+            f"prompt_chars={len(prompt_text)} system_chars={len(system_prompt_text or '')}",
+            flush=True,
+        )
 
     if provider is None:
         error = f"Provider '{provider_name}' is not enabled on this worker"
+        append_trace_event(trace_events, "error", error_type="ProviderNotEnabled", detail=error)
     else:
         req = ExecutionRequest(
-            prompt=job["prompt"],
-            model=job.get("model") or None,
+            prompt=prompt_text,
+            model=model_name,
             mode=mode,
             session_id=session_id,
             store_session=store_session,
-            system_prompt=job.get("system_prompt") or None,
+            system_prompt=system_prompt_text,
             timeout_seconds=TIMEOUT,
+            job_id=job_id,
+            trace_events=trace_events,
         )
         try:
             outcome = provider.execute_turn(req)
@@ -82,18 +111,64 @@ def execute(job_id: str) -> None:
             session_id = outcome.session_id
             usage = outcome.usage
             status = "completed" if result else "failed"
-            if not result:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            if result:
+                append_trace_event(
+                    trace_events,
+                    "completed",
+                    answer_chars=len(result),
+                    duration_ms=elapsed_ms,
+                )
+            else:
                 error = f"{provider_name} returned no answer"
+                append_trace_event(
+                    trace_events,
+                    "empty_result",
+                    detail=error,
+                    duration_ms=elapsed_ms,
+                )
+                print(
+                    f"job={job_id} provider={provider_name} model={model_name or 'default'} "
+                    f"mode={mode} error={error}",
+                    flush=True,
+                )
         except subprocess.TimeoutExpired:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
             error = f"{provider_name} exceeded {TIMEOUT}s timeout"
-            print(f"job={job_id} provider={provider_name} error={error}", flush=True)
-        except Exception as exc:
-            error = f"{provider_name} request failed: {type(exc).__name__}"
-            detail = " ".join(str(exc).split())[:2000] or "no error detail"
+            append_trace_event(
+                trace_events,
+                "timeout",
+                error_type="TimeoutExpired",
+                detail=error,
+                duration_ms=elapsed_ms,
+            )
             print(
-                f"job={job_id} provider={provider_name} error_type={type(exc).__name__} detail={detail}",
+                f"job={job_id} provider={provider_name} model={model_name or 'default'} "
+                f"mode={mode} error={error}",
                 flush=True,
             )
+            tb_text = traceback.format_exc().rstrip()
+            if tb_text:
+                print(f"job={job_id} provider={provider_name} traceback:\n{tb_text}", flush=True)
+        except Exception as exc:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            error = f"{provider_name} request failed: {type(exc).__name__}"
+            detail = " ".join(str(exc).split())[:2000] or "no error detail"
+            append_trace_event(
+                trace_events,
+                "error",
+                error_type=type(exc).__name__,
+                detail=detail,
+                duration_ms=elapsed_ms,
+            )
+            print(
+                f"job={job_id} provider={provider_name} model={model_name or 'default'} "
+                f"mode={mode} error_type={type(exc).__name__} detail={detail}",
+                flush=True,
+            )
+            tb_text = traceback.format_exc().rstrip()
+            if tb_text:
+                print(f"job={job_id} provider={provider_name} traceback:\n{tb_text}", flush=True)
 
     duration_ms = int((time.monotonic() - start) * 1000)
     if redis.exists(key):
@@ -105,6 +180,7 @@ def execute(job_id: str) -> None:
                 "error": error or "",
                 "session_id": session_id or "",
                 "usage": json.dumps(usage) if usage else "",
+                "events": json.dumps(trace_events[-50:], ensure_ascii=False),
                 "duration_ms": duration_ms,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             },

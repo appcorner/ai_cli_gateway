@@ -96,10 +96,16 @@ def fetch(job_id: str):
         usage = json.loads(job.get("usage") or job.get("agy_usage") or "") or None
     except json.JSONDecodeError:
         usage = None
+    try:
+        parsed_events = json.loads(job.get("events") or "") if job.get("events") else []
+    except (TypeError, json.JSONDecodeError):
+        parsed_events = []
+    events = parsed_events if isinstance(parsed_events, list) else []
     return {"id": job["id"], "status": job["status"], "model": job.get("model") or None,
             "provider": job.get("provider") or "codex",
             "session_id": job.get("session_id") or None,
             "usage": usage,
+            "events": events,
             "result": job.get("result") or None, "error": job.get("error") or None,
             "duration_ms": int(job["duration_ms"]) if job.get("duration_ms") else None,
             "created_at": job.get("created_at") or None, "finished_at": job.get("finished_at") or None}
@@ -107,6 +113,7 @@ def fetch(job_id: str):
 
 def public_job(job):
     result = dict(job)
+    result.pop("events", None)
     if result.get("provider") == "codex":
         result["provider"] = "openai"
     return result

@@ -7,13 +7,32 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 from typing import Any
 
-from .base import BaseCLIProvider, ExecutionRequest, ExecutionResult, ProviderCapabilities
+from .base import (
+    BaseCLIProvider,
+    ExecutionRequest,
+    ExecutionResult,
+    ProviderCapabilities,
+    agent_network_enabled,
+    append_trace_event,
+    trace_cli_streams,
+    truncate_single_line,
+    worker_trace_enabled,
+    workspace_context,
+)
+from .mcp_sync import sync_agy_mcp_config
 from .session_store import GatewaySessionStore
 
 AGY_SESSION_MESSAGE_LIMIT = 80
+AGY_ALLOWED_TOOL_PERMISSIONS = frozenset({
+    "request-review",
+    "proceed-in-sandbox",
+    "always-proceed",
+    "strict",
+})
 AGY_NON_OAUTH_ENV = frozenset({
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
@@ -26,8 +45,8 @@ AGY_NON_OAUTH_ENV = frozenset({
 })
 
 
-def agy_environment() -> dict[str, str]:
-    return BaseCLIProvider.sanitize_env(extra_blocked=AGY_NON_OAUTH_ENV)
+def agy_environment(mode: str | None = None) -> dict[str, str]:
+    return BaseCLIProvider.sanitize_env(extra_blocked=AGY_NON_OAUTH_ENV, mode=mode)
 
 
 def agy_cli_home() -> str:
@@ -78,6 +97,158 @@ def read_models_from_agy(timeout: int = 60) -> list[dict[str, Any]]:
     return models
 
 
+def _extract_error_text(value: Any) -> str:
+    """Format an error value into a bounded single-line string."""
+    if isinstance(value, dict):
+        text = value.get("message") or value.get("code") or value.get("name") or json.dumps(value, ensure_ascii=False)
+    else:
+        text = value
+    return truncate_single_line(text, 200)
+
+
+def _summarize_agy_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Extract non-sensitive metadata from an agy NDJSON stream event."""
+    event_name = str(event.get("event") or event.get("type") or "unknown")
+    if event_name == "result":
+        res = event.get("result") if isinstance(event.get("result"), dict) else {}
+        resp = res.get("response")
+        response_len = len(resp.strip()) if isinstance(resp, str) else 0
+        summary: dict[str, Any] = {
+            "event": "result",
+            "status": res.get("status"),
+            "response_len": response_len,
+            "has_structured_output": res.get("structured_output") is not None,
+            "keys": sorted(str(k) for k in res.keys()),
+        }
+        for key in ("finished_reason", "num_turns", "duration_seconds"):
+            if res.get(key) is not None:
+                summary[key] = res[key]
+        if isinstance(res.get("usage"), dict) and res.get("usage"):
+            summary["usage"] = res["usage"]
+        err = res.get("error") or res.get("error_message") or res.get("message")
+        if err:
+            summary["error"] = _extract_error_text(err)
+        return summary
+
+    summary = {"event": event_name, "keys": sorted(str(k) for k in event.keys())}
+    containers = [event] + [
+        event[k]
+        for k in ("step", "data", "part", "payload", "tool", "delta")
+        if isinstance(event.get(k), dict)
+    ]
+    for field in ("step_type", "type", "status", "state", "finished_reason", "reason", "model", "code"):
+        for container in containers:
+            val = container.get(field)
+            if field == "type" and container is event and val == event_name:
+                continue
+            if isinstance(val, (str, int, float, bool)) and val != "":
+                summary[field] = val
+                break
+    for container in containers:
+        for key in ("tool_name", "tool", "name"):
+            val = container.get(key)
+            if isinstance(val, (str, int, float)) and val != "":
+                summary["tool_name"] = val
+                break
+        if "tool_name" in summary:
+            break
+    for container in containers:
+        for key in ("text", "text_delta", "delta", "content"):
+            val = container.get(key)
+            if isinstance(val, str) and val:
+                summary["text_len"] = len(val)
+                break
+        if "text_len" in summary:
+            break
+    is_error_event = (
+        event_name == "error"
+        or summary.get("step_type") == "error"
+        or summary.get("type") == "error"
+    )
+    for container in containers:
+        err = container.get("error") or (container.get("message") if is_error_event else None)
+        if err:
+            summary["error"] = _extract_error_text(err)
+            break
+    return summary
+
+
+def _compact_event_tag(ev: dict[str, Any]) -> str:
+    """Render a summarized stream event as a compact tag for single-line diagnostics."""
+    name = str(ev.get("event") or "unknown")
+    if name == "result":
+        parts = [str(ev.get("status") or "unknown")]
+        if ev.get("finished_reason") is not None:
+            parts.append(f"finished_reason={truncate_single_line(ev['finished_reason'], 60)}")
+        parts.append(f"len={ev.get('response_len', 0)}")
+        if ev.get("error"):
+            parts.append(f"err={truncate_single_line(ev['error'], 60)}")
+        return f"result({','.join(parts)})"
+
+    parts = []
+    if ev.get("step_type"):
+        parts.append(truncate_single_line(ev["step_type"], 60))
+    elif ev.get("type") and ev["type"] != name:
+        parts.append(truncate_single_line(ev["type"], 60))
+    for field in ("status", "state", "tool_name", "finished_reason", "reason", "code"):
+        if ev.get(field) is not None:
+            label = "name" if field == "tool_name" else field
+            parts.append(f"{label}={truncate_single_line(ev[field], 60)}")
+    if ev.get("text_len"):
+        parts.append(f"text_len={ev['text_len']}")
+    if ev.get("error"):
+        parts.append(f"err={truncate_single_line(ev['error'], 60)}")
+    return f"{name}({','.join(parts)})" if parts else name
+
+
+def _format_agy_diagnostics(diag: dict[str, Any]) -> str:
+    """Format safe execution diagnostics into a compact single-line summary."""
+    parts = [
+        f"rc={diag.get('rc')}",
+        f"duration_ms={diag.get('duration_ms')}",
+        f"result_count={diag.get('result_count', 0)}",
+        f"status={diag.get('status') or 'none'}",
+    ]
+    if diag.get("finished_reason") is not None:
+        parts.append(f"finished_reason={truncate_single_line(diag['finished_reason'], 60)}")
+    if diag.get("num_turns") is not None:
+        parts.append(f"num_turns={diag['num_turns']}")
+    parts.append(f"response_len={diag.get('response_len', 0)}")
+    if diag.get("has_structured_output"):
+        parts.append("structured_output=true")
+    if diag.get("earlier_nonempty_results", 0) > 0:
+        parts.append(f"earlier_nonempty_results={diag['earlier_nonempty_results']}")
+    if diag.get("result_error"):
+        parts.append(f"result_error={truncate_single_line(diag['result_error'], 200)}")
+    usage = diag.get("usage")
+    if isinstance(usage, dict) and usage:
+        usage_map = (
+            ("in", "input_tokens"),
+            ("out", "output_tokens"),
+            ("think", "thinking_tokens"),
+            ("total", "total_tokens"),
+        )
+        usage_parts = [f"{label}:{usage[key]}" for label, key in usage_map if usage.get(key) is not None]
+        if usage_parts:
+            parts.append(f"usage={','.join(usage_parts)}")
+    envelope_keys = diag.get("envelope_keys") or []
+    if envelope_keys:
+        parts.append(f"envelope_keys=[{','.join(str(k) for k in envelope_keys[:20])}]")
+    event_tags = [_compact_event_tag(ev) for ev in (diag.get("events") or [])]
+    if len(event_tags) > 20:
+        shown_tags = event_tags[:10] + [f"...(+{len(event_tags) - 20})"] + event_tags[-10:]
+    else:
+        shown_tags = event_tags
+    rendered_events = ",".join(shown_tags)
+    if len(rendered_events) > 550:
+        rendered_events = rendered_events[:550] + "...[truncated]"
+    parts.append(f"events=[{rendered_events}]")
+    parts.append(f"non_json={diag.get('non_json_lines', 0)}")
+    stderr_tail = diag.get("stderr_tail") or ""
+    parts.append(f"stderr={truncate_single_line(stderr_tail, 400) if stderr_tail else 'none'}")
+    return " ".join(parts)
+
+
 def run_agy_turn(
     prompt: str,
     model: str | None,
@@ -86,21 +257,52 @@ def run_agy_turn(
     persist: bool = False,
     mode: str = "chat",
     timeout: int = 120,
+    *,
+    job_id: str | None = None,
+    trace_events: list[dict[str, Any]] | None = None,
+    diagnostics_out: dict[str, Any] | None = None,
 ) -> tuple[str, str | None, dict[str, Any]]:
     formatted_prompt = f"User request:\n{prompt}"
     if system_prompt:
         formatted_prompt = f"System instructions:\n{system_prompt}\n\n{formatted_prompt}"
-    with tempfile.TemporaryDirectory(prefix="agy-job-") as workdir:
+    trace_enabled = worker_trace_enabled()
+    cli_start = time.monotonic()
+    with workspace_context("agy-job-", tempfile.TemporaryDirectory) as workdir:
         command = [
             "agy", "--input-format", "stream-json", "--output-format", "stream-json",
-            "--print-timeout", f"{timeout}s", "--sandbox",
+            "--print-timeout", f"{timeout}s",
         ]
         if mode == "chat":
-            command.append("--disable-slash-commands")
+            command.extend(["--sandbox", "--disable-slash-commands"])
+        elif agent_network_enabled():
+            command.append("--dangerously-skip-permissions")
+        else:
+            command.append("--sandbox")
         if model:
             command.extend(["--model", model])
         if session_id:
             command.extend(["--conversation", session_id])
+        append_trace_event(
+            trace_events,
+            "cli_start",
+            provider="agy",
+            mode=mode,
+            model=model or "default",
+            persist=persist,
+            resume=bool(session_id),
+            workspace=workdir,
+            command=command,
+            prompt_chars=len(prompt),
+            system_prompt_chars=len(system_prompt or ""),
+        )
+        if trace_enabled:
+            print(
+                f"trace job={job_id or '-'} provider=agy stage=cli_start mode={mode} "
+                f"model={model or 'default'} persist={persist} resume={bool(session_id)} "
+                f"workspace={workdir} prompt_chars={len(prompt)} "
+                f"system_chars={len(system_prompt or '')} cmd={json.dumps(command)}",
+                flush=True,
+            )
         input_event = json.dumps({"event": "user", "message": {"content": formatted_prompt}}) + "\n"
         process = subprocess.run(
             command,
@@ -110,20 +312,98 @@ def run_agy_turn(
             text=True,
             timeout=timeout + 30,
             check=False,
-            env=agy_environment(),
+            env=agy_environment(mode),
         )
+    duration_ms = int((time.monotonic() - cli_start) * 1000)
+    stdout_text = getattr(process, "stdout", "") or ""
+    stderr_text = getattr(process, "stderr", "") or ""
+    trace_cli_streams(job_id, "agy", stdout_text, stderr_text)
+
     envelope = None
-    for line in process.stdout.splitlines():
+    result_summary: dict[str, Any] = {}
+    stdout_lines = 0
+    non_json_lines = 0
+    result_count = 0
+    earlier_nonempty_result_count = 0
+    event_summaries: list[dict[str, Any]] = []
+
+    for line in stdout_text.splitlines():
+        stdout_lines += 1
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            non_json_lines += 1
             continue
+        if not isinstance(event, dict):
+            non_json_lines += 1
+            continue
+        summary = _summarize_agy_event(event)
+        event_summaries.append(summary)
         if event.get("event") == "result":
+            result_count += 1
+            if (
+                envelope is not None
+                and isinstance(envelope.get("response"), str)
+                and envelope.get("response", "").strip()
+            ):
+                earlier_nonempty_result_count += 1
             envelope = event.get("result") or {}
+            result_summary = summary
+
+    stderr_tail = truncate_single_line(stderr_text[-1000:], 400) if stderr_text.strip() else ""
+    diagnostics = {
+        "rc": process.returncode,
+        "duration_ms": duration_ms,
+        "stdout_lines": stdout_lines,
+        "non_json_lines": non_json_lines,
+        "result_count": result_count,
+        "earlier_nonempty_results": earlier_nonempty_result_count,
+        "status": result_summary.get("status") if envelope is not None else None,
+        "finished_reason": result_summary.get("finished_reason") if envelope is not None else None,
+        "num_turns": result_summary.get("num_turns") if envelope is not None else None,
+        "response_len": result_summary.get("response_len", 0) if envelope is not None else 0,
+        "has_structured_output": result_summary.get("has_structured_output", False) if envelope is not None else False,
+        "result_error": result_summary.get("error") if envelope is not None else None,
+        "usage": result_summary.get("usage") if envelope is not None else None,
+        "envelope_keys": result_summary.get("keys", []) if envelope is not None else [],
+        "events": event_summaries,
+        "stderr_tail": stderr_tail,
+    }
+    if diagnostics_out is not None:
+        diagnostics_out.update(diagnostics)
+
+    append_trace_event(
+        trace_events,
+        "cli_exit",
+        provider="agy",
+        rc=process.returncode,
+        duration_ms=duration_ms,
+        stdout_lines=stdout_lines,
+        non_json_lines=non_json_lines,
+        result_count=result_count,
+        earlier_nonempty_results=earlier_nonempty_result_count,
+        status=diagnostics["status"],
+        finished_reason=diagnostics["finished_reason"],
+        num_turns=diagnostics["num_turns"],
+        response_len=diagnostics["response_len"],
+        has_structured_output=diagnostics["has_structured_output"],
+        result_error=diagnostics["result_error"],
+        usage=diagnostics["usage"],
+        envelope_keys=diagnostics["envelope_keys"],
+        events=event_summaries[:30],
+        events_truncated=max(0, len(event_summaries) - 30) or None,
+        stderr_tail=stderr_tail or None,
+    )
+    if trace_enabled:
+        print(
+            f"trace job={job_id or '-'} provider=agy stage=cli_exit {_format_agy_diagnostics(diagnostics)}",
+            flush=True,
+        )
+
     if envelope is None:
-        raise RuntimeError("agy did not return a result event")
+        raise RuntimeError(f"agy did not return a result event ({_format_agy_diagnostics(diagnostics)})")
     if process.returncode != 0 or envelope.get("status") != "SUCCESS":
-        raise RuntimeError("agy did not complete successfully")
+        raise RuntimeError(f"agy did not complete successfully ({_format_agy_diagnostics(diagnostics)})")
     answer = (envelope.get("response") or "").strip()
     conversation_id = envelope.get("conversation_id") if persist else None
     return answer, conversation_id, envelope.get("usage") or {}
@@ -269,7 +549,10 @@ class AgyProvider(BaseCLIProvider):
                     settings = json.load(settings_file)
             except (OSError, json.JSONDecodeError):
                 pass
-        settings["toolPermission"] = "request-review"
+        tool_permission = os.environ.get("AGY_TOOL_PERMISSION", "proceed-in-sandbox").strip()
+        if tool_permission not in AGY_ALLOWED_TOOL_PERMISSIONS:
+            tool_permission = "proceed-in-sandbox"
+        settings["toolPermission"] = tool_permission
         # The Gateway only supports Antigravity's Google account OAuth sign-in.
         # Remove a stale Gemini API-key provider setting from older deployments.
         settings.pop("modelProvider", None)
@@ -278,10 +561,12 @@ class AgyProvider(BaseCLIProvider):
             json.dump(settings, settings_file)
         os.replace(temporary_settings_path, settings_path)
         os.chmod(settings_path, 0o600)
+        sync_agy_mcp_config()
 
     def execute_turn(self, req: ExecutionRequest) -> ExecutionResult:
         timeout = req.timeout_seconds or self.timeout
         persist = req.store_session or bool(req.session_id)
+        diagnostics: dict[str, Any] = {}
         answer, conversation_id, usage = run_agy_turn(
             req.prompt,
             req.model,
@@ -290,13 +575,18 @@ class AgyProvider(BaseCLIProvider):
             persist=persist,
             mode=req.mode,
             timeout=timeout,
+            job_id=req.job_id,
+            trace_events=req.trace_events,
+            diagnostics_out=diagnostics,
         )
+        if not answer:
+            detail = _format_agy_diagnostics(diagnostics) if diagnostics else ""
+            message = f"agy returned no answer ({detail})" if detail else "agy returned no answer"
+            raise RuntimeError(message)
         if conversation_id and persist:
             _SESSION_STORE.record_turn(
                 "agy", conversation_id, req.prompt, answer, req.model, req.mode
             )
-        if not answer:
-            raise RuntimeError("agy returned no answer")
         return ExecutionResult(text=answer, session_id=conversation_id, usage=usage)
 
     def list_models(self) -> list[dict[str, Any]]:

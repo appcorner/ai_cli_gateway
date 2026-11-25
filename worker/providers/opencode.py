@@ -5,9 +5,21 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from typing import Any
 
-from .base import BaseCLIProvider, ExecutionRequest, ExecutionResult, ProviderCapabilities
+from .base import (
+    BaseCLIProvider,
+    ExecutionRequest,
+    ExecutionResult,
+    ProviderCapabilities,
+    append_trace_event,
+    trace_cli_streams,
+    truncate_single_line,
+    worker_trace_enabled,
+    workspace_context,
+)
+from .mcp_sync import sync_opencode_mcp_config
 from .session_store import GatewaySessionStore
 
 OPENCODE_SESSION_MESSAGE_LIMIT = 80
@@ -24,7 +36,11 @@ OPENCODE_CHAT_CONFIG = json.dumps({
 
 def opencode_environment(mode: str = "chat") -> dict[str, str]:
     overrides = {"OPENCODE_CONFIG_CONTENT": OPENCODE_CHAT_CONFIG} if mode == "chat" else None
-    return BaseCLIProvider.sanitize_env(extra_blocked=OPENCODE_BLOCKED_ENV, overrides=overrides)
+    return BaseCLIProvider.sanitize_env(
+        extra_blocked=OPENCODE_BLOCKED_ENV,
+        overrides=overrides,
+        mode=mode,
+    )
 
 
 def opencode_data_home() -> str:
@@ -156,12 +172,17 @@ def run_opencode_turn(
     persist: bool = False,
     mode: str = "chat",
     timeout: int = 120,
+    *,
+    job_id: str | None = None,
+    trace_events: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str | None, dict[str, Any]]:
     formatted_prompt = prompt
     if system_prompt:
         formatted_prompt = f"System instructions:\n{system_prompt}\n\nUser request:\n{prompt}"
 
-    with tempfile.TemporaryDirectory(prefix="opencode-job-") as workdir:
+    trace_enabled = worker_trace_enabled()
+    cli_start = time.monotonic()
+    with workspace_context("opencode-job-", tempfile.TemporaryDirectory) as workdir:
         resolved_model = resolve_opencode_model(model)
         command = ["opencode", "run", "--format", "json"]
         if mode == "chat":
@@ -170,7 +191,30 @@ def run_opencode_turn(
             command.extend(["--model", resolved_model])
         if session_id:
             command.extend(["--session", session_id])
+        safe_command = [*command, "--", "<prompt>"]
         command.extend(["--", formatted_prompt])
+
+        append_trace_event(
+            trace_events,
+            "cli_start",
+            provider="opencode",
+            mode=mode,
+            model=resolved_model or "default",
+            persist=persist,
+            resume=bool(session_id),
+            workspace=workdir,
+            command=safe_command,
+            prompt_chars=len(prompt),
+            system_prompt_chars=len(system_prompt or ""),
+        )
+        if trace_enabled:
+            print(
+                f"trace job={job_id or '-'} provider=opencode stage=cli_start mode={mode} "
+                f"model={resolved_model or 'default'} persist={persist} resume={bool(session_id)} "
+                f"workspace={workdir} prompt_chars={len(prompt)} "
+                f"system_chars={len(system_prompt or '')} cmd={json.dumps(safe_command)}",
+                flush=True,
+            )
 
         process = subprocess.run(
             command,
@@ -183,13 +227,39 @@ def run_opencode_turn(
             env=opencode_environment(mode),
         )
 
-    answer, detected_session_id, usage, error_type = _extract_opencode_output(process.stdout or "")
-    if process.returncode != 0 or not answer:
+    duration_ms = int((time.monotonic() - cli_start) * 1000)
+    stdout_text = getattr(process, "stdout", "") or ""
+    stderr_text = getattr(process, "stderr", "") or ""
+    trace_cli_streams(job_id, "opencode", stdout_text, stderr_text)
+
+    answer, detected_session_id, usage, error_type = _extract_opencode_output(stdout_text)
+    stderr_tail = truncate_single_line(stderr_text[-1000:], 400) if stderr_text.strip() else ""
+    append_trace_event(
+        trace_events,
+        "cli_exit",
+        provider="opencode",
+        rc=process.returncode,
+        duration_ms=duration_ms,
+        has_answer=bool(answer),
+        answer_chars=len(answer),
+        error=error_type,
+        usage=usage or None,
+        stderr_tail=stderr_tail or None,
+    )
+    if trace_enabled:
         print(
-            f"opencode run failed: rc={process.returncode} has_answer={bool(answer)} error={error_type or 'none'}",
+            f"trace job={job_id or '-'} provider=opencode stage=cli_exit rc={process.returncode} "
+            f"duration_ms={duration_ms} has_answer={bool(answer)} error={error_type or 'none'} "
+            f"stderr={stderr_tail or 'none'}",
             flush=True,
         )
-        raise RuntimeError("opencode did not complete successfully")
+    if process.returncode != 0 or not answer:
+        summary = (
+            f"rc={process.returncode} duration_ms={duration_ms} has_answer={bool(answer)} "
+            f"error={error_type or 'none'} stderr={stderr_tail or 'none'}"
+        )
+        print(f"opencode run failed: {summary}", flush=True)
+        raise RuntimeError(f"opencode did not complete successfully ({summary})")
     returned_session_id = (detected_session_id or session_id) if persist else None
     return answer, returned_session_id, usage
 
@@ -227,6 +297,9 @@ class OpenCodeProvider(BaseCLIProvider):
         supports_model_discovery=True,
     )
 
+    def startup_init(self) -> None:
+        sync_opencode_mcp_config()
+
     def execute_turn(self, req: ExecutionRequest) -> ExecutionResult:
         timeout = req.timeout_seconds or self.timeout
         persist = req.store_session or bool(req.session_id)
@@ -238,6 +311,8 @@ class OpenCodeProvider(BaseCLIProvider):
             persist=persist,
             mode=req.mode,
             timeout=timeout,
+            job_id=req.job_id,
+            trace_events=req.trace_events,
         )
         if returned_session_id and persist:
             _SESSION_STORE.record_turn(
